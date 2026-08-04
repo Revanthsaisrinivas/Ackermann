@@ -1,0 +1,105 @@
+terminal 1:
+
+cd ~/Robotics/RL_Obstacle_Avoidance/ros2_ws
+
+source /opt/ros/humble/setup.bash
+source install/setup.bash
+
+ros2 launch robot_description gazebo.launch.py
+
+terminal 2:
+source /opt/ros/humble/setup.bash
+
+gzclient
+
+terminal 3:
+cd ~/Robotics/RL_Obstacle_Avoidance/ros2_ws
+
+source /opt/ros/humble/setup.bash
+source install/setup.bash
+
+ros2 run robot_controller obstacle_avoidance
+
+
+for new dfs:
+
+Terminal 1
+------------
+cd ~/Robotics/RL_Obstacle_Avoidance/ros2_ws
+
+source /opt/ros/humble/setup.bash
+source install/setup.bash
+
+ros2 launch robot_description gazebo.launch.py x_cell:=2 y_cell:=2
+
+Terminal 2
+------------
+(optional)
+gzclient (only if GUI doesn't start)
+
+Terminal 3
+------------
+Run obstacle_avoidance.py
+
+Terminal 4 (optional)
+------------
+ros2 topic echo /cmd_vel
+or
+ros2 node list
+
+bash latest dfs non solved heading issue :
+cd ~/Robotics/RL_Obstacle_Avoidance/ros2_ws
+source /opt/ros/humble/setup.bash
+colcon build
+//colcon build --packages-select robot_description robot_controller
+source install/setup.bash
+ros2 launch robot_description gazebo.launch.py x_cell:=0 y_cell:=0 heading:=0
+
+
+q-table:
+cd ~/Robotics/RL_Obstacle_Avoidance/ros2_ws
+
+python3 show_qtable.py
+
+explorer.exe .
+
+
+rl cmnds:
+cd ~/Robotics/RL_Obstacle_Avoidance/ros2_ws
+colcon build --packages-select robot_controller robot_description
+source install/setup.bash
+
+cd ~/Robotics/RL_Obstacle_Avoidance/ros2_ws
+
+source install/setup.bash
+
+ros2 launch robot_description gazebo.launch.py
+
+ros2 run robot_controller run_policy --ros-args -p goal_x:=4 -p goal_y:=4
+
+
+train:
+terminal 1:
+cd ~/Robotics/RL_Obstacle_Avoidance/ros2_ws
+
+source install/setup.bash
+
+ros2 launch robot_description gazebo.launch.py
+
+terminal 2:
+cd ~/Robotics/RL_Obstacle_Avoidance/ros2_ws
+
+source install/setup.bash
+
+ros2 launch robot_controller localization.launch.py
+
+terminal 3:
+cd ~/Robotics/RL_Obstacle_Avoidance/ros2_ws
+
+source install/setup.bash
+
+ros2 run robot_controller train
+
+
+to show no of episodes trained:
+grep -n "EPISODES" src/robot_controller/robot_controller/train.py

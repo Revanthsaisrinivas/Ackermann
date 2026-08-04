@@ -1,0 +1,45 @@
+import pickle
+import csv
+
+with open("src/robot_controller/robot_controller/q_table.pkl", "rb") as f:
+    data = pickle.load(f)
+
+q_table = data["q_table"]
+
+actions = ["EAST", "NORTH", "WEST", "SOUTH"]
+
+with open("q_table.csv", "w", newline="") as f:
+    writer = csv.writer(f)
+
+    writer.writerow([
+        "Robot_X",
+        "Robot_Y",
+        "Goal_X",
+        "Goal_Y",
+        "East",
+        "North",
+        "West",
+        "South",
+        "Best_Action",
+        "Best_Q"
+    ])
+
+    for state, values in q_table.items():
+
+        rx, ry, gx, gy = state
+
+        best = max(range(4), key=lambda i: values[i])
+
+        writer.writerow([
+            rx,
+            ry,
+            gx,
+            gy,
+            round(values[0], 4),
+            round(values[1], 4),
+            round(values[2], 4),
+            round(values[3], 4),
+            actions[best],
+            round(values[best], 4)
+        ])
+print("Created q_table.csv successfully!")
