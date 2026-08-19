@@ -1,5 +1,4 @@
 <?xml version="1.0" ?>
-
 <sdf version="1.6">
 
   <world name="maze_world">
@@ -31,6 +30,24 @@
         </constraints>
       </ode>
     </physics>
+
+
+    <!-- ================= ROS STATE PLUGIN ================= -->
+
+    <!-- Provides /gazebo/set_entity_state and /gazebo/get_entity_state.
+         This is a WORLD plugin, not a system plugin -- it belongs
+         here in the SDF, NOT on gzserver's `-s` command-line flag
+         (that flag is for system plugins like libgazebo_ros_init.so /
+         libgazebo_ros_factory.so; loading a world plugin that way
+         fails with "detected an incorrect plugin type" and the
+         services never come up). Required by gazebo.launch.py's
+         post-spawn pose-correction step. -->
+    <plugin name="gazebo_ros_state" filename="libgazebo_ros_state.so">
+      <ros>
+        <namespace>/</namespace>
+      </ros>
+      <update_rate>1.0</update_rate>
+    </plugin>
 
 
     <!-- ================= DEFAULT VIEW ================= -->

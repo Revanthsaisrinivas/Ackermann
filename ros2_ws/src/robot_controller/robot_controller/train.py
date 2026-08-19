@@ -18,7 +18,7 @@ import random
 # TRAINING PARAMETERS
 # =====================================================
 
-EPISODES = 100
+EPISODES = 1000
 PRINT_EVERY = 5
 SAVE_FILE = os.path.join(
     os.path.dirname(__file__),
@@ -36,7 +36,6 @@ def train():
 
     agent = QLearningAgent(
         actions=env.ACTIONS,
-        states=env.get_all_states(),
         learning_rate=0.1,
         discount_factor=0.95,
         epsilon=1.0,

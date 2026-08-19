@@ -3,7 +3,13 @@ import csv
 
 # Load Q-table
 with open("src/robot_controller/robot_controller/q_table.pkl", "rb") as f:
-    q = pickle.load(f)
+    data = pickle.load(f)
+
+# Extract the actual Q-table
+if isinstance(data, dict) and "q_table" in data:
+    q = data["q_table"]
+else:
+    q = data
 
 actions = ["EAST", "NORTH", "WEST", "SOUTH"]
 

@@ -26,12 +26,16 @@ Q_TABLE_FILE = os.path.join(
 MAX_STEPS = 200
 
 
-def run_policy(start=(0, 0), goal=(4, 4)):
+def run_policy(start=(0, 0), goal=(4, 4), start_heading=0):
     # Initialize ROS2 and the controller node
     if not rclpy.ok():
         rclpy.init()
 
-    robot = GridRLController()
+    robot = GridRLController(
+        start_x=start[0],
+        start_y=start[1],
+        start_heading=start_heading
+    )
 
     # Create and explicitly reset the environment with the correct start and goal
     env = MazeEnvironment()
@@ -87,6 +91,9 @@ def run_policy(start=(0, 0), goal=(4, 4)):
                 continue
 
             current_cell = robot.current_cell
+            robot.get_logger().info(
+    f"PATH: Step {steps}  Cell={current_cell}"
+)
 
             # Check if goal has been reached
             if current_cell == goal:
@@ -110,25 +117,20 @@ def run_policy(start=(0, 0), goal=(4, 4)):
             # Construct state descriptor expected by the Q-learning agent
             state = (current_cell[0], current_cell[1], goal[0], goal[1])
 
-            # Dynamically fetch valid actions using environment actions framework and wall detection
-            walls = robot.get_current_walls()
+            # Use the same valid-action logic as the training environment
+            env.reset(start=current_cell, goal=goal)
+
+            valid_actions = env.get_valid_actions()
 
             robot.get_logger().info(f"Current Cell : {current_cell}")
             robot.get_logger().info(f"Heading      : {robot.DIRECTION_NAMES[robot.heading]}")
-            robot.get_logger().info(f"Walls        : {walls}")
-
-            valid_actions = []
-
-            for action in env.ACTIONS:
-                if not walls.get(action, True):
-                    neighbor = robot.get_neighbor(current_cell, action)
-                    if (
-                        0 <= neighbor[0] < grid_size and
-                        0 <= neighbor[1] < grid_size
-                    ):
-                        valid_actions.append(action)
-
+            robot.get_logger().info(
+                f"Valid Action Names : {[robot.DIRECTION_NAMES[a] for a in valid_actions]}"
+            )
             robot.get_logger().info(f"Valid Actions: {valid_actions}")
+            robot.get_logger().info(
+                f"Valid Action Names : {[robot.DIRECTION_NAMES[a] for a in valid_actions]}"
+            )
 
             if not valid_actions:
                 robot.get_logger().error("No valid actions available! Robot is trapped.")
@@ -136,6 +138,7 @@ def run_policy(start=(0, 0), goal=(4, 4)):
                 break
 
             q = agent.q_table[state]
+            robot.get_logger().info(f"RAW Q = {q}")
 
             robot.get_logger().info("Q-values:")
             for a in valid_actions:
@@ -143,8 +146,26 @@ def run_policy(start=(0, 0), goal=(4, 4)):
                     f"  {robot.DIRECTION_NAMES[a]} : {q[a]:.4f}"
                 )
 
+            # ---- Step 1: log the complete decision ----
+            robot.get_logger().info("=" * 50)
+            robot.get_logger().info(f"State : {state}")
+            robot.get_logger().info(f"Current Cell : {current_cell}")
+
+            for a in valid_actions:
+                robot.get_logger().info(
+                    f"{robot.DIRECTION_NAMES[a]} : {q[a]:.6f}"
+                )
+
             # Get the best action from the agent using the Q-table
             action = agent.best_action(state, valid_actions)
+            robot.get_logger().info(
+                f"PATH: Action={robot.DIRECTION_NAMES[action]}"
+            )
+
+            robot.get_logger().info(
+                f"Chosen Action : {robot.DIRECTION_NAMES[action]}"
+            )
+            # ---- end Step 1 ----
 
             if action is None:
                 robot.get_logger().error("Agent returned no valid action.")
@@ -152,6 +173,11 @@ def run_policy(start=(0, 0), goal=(4, 4)):
                 break
 
             target_cell = robot.get_neighbor(current_cell, action)
+
+            robot.get_logger().info(
+                f"Target Cell  : {target_cell}"
+            )
+
             steps += 1
 
             robot.get_logger().info("--------------------------------------")
@@ -171,6 +197,18 @@ def run_policy(start=(0, 0), goal=(4, 4)):
                     robot.get_logger().error("Movement timeout.")
                     robot.stop_robot()
                     return
+
+            # ---- Step 2: verify execution ----
+            robot.get_logger().info(
+                f"Expected Cell : {target_cell}"
+            )
+            robot.get_logger().info(
+                f"Actual Cell   : {robot.current_cell}"
+            )
+            robot.get_logger().info(
+                f"Heading After Move : {robot.DIRECTION_NAMES[robot.heading]}"
+            )
+            # ---- end Step 2 ----
 
             # Verify that the robot actually reached the intended cell
             if robot.current_cell != target_cell:
@@ -204,6 +242,7 @@ def main(args=None):
 
     node.declare_parameter("start_x", 0)
     node.declare_parameter("start_y", 0)
+    node.declare_parameter("start_heading", 0)
     node.declare_parameter("goal_x", 4)
     node.declare_parameter("goal_y", 4)
 
@@ -212,18 +251,25 @@ def main(args=None):
         node.get_parameter("start_y").value
     )
 
+    start_heading = node.get_parameter("start_heading").value
+
     goal = (
         node.get_parameter("goal_x").value,
         node.get_parameter("goal_y").value
     )
 
     node.get_logger().info(f"Start : {start}")
+    node.get_logger().info(f"Heading : {start_heading}")
     node.get_logger().info(f"Goal  : {goal}")
 
     node.destroy_node()
     rclpy.shutdown()
 
-    run_policy(start=start, goal=goal)
+    run_policy(
+        start=start,
+        goal=goal,
+        start_heading=start_heading
+    )
 
 
 if __name__ == "__main__":

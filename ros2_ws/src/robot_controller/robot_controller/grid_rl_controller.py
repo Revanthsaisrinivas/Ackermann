@@ -35,20 +35,17 @@ class GridRLController(Node):
         SOUTH: (0, -1)
     }
 
-    def __init__(self):
+    def __init__(self, start_x=0, start_y=0, start_heading=0):
         super().__init__('grid_rl_controller')
 
         # =====================================================
-        # ROS PARAMETERS
+        # START POSITION / HEADING (passed directly from
+        # run_policy.py instead of ROS parameters)
         # =====================================================
 
-        self.declare_parameter('x_cell', 0)
-        self.declare_parameter('y_cell', 0)
-        self.declare_parameter('heading', 0)
-
-        self.start_x_cell = self.get_parameter('x_cell').value
-        self.start_y_cell = self.get_parameter('y_cell').value
-        self.configured_start_heading = self.get_parameter('heading').value
+        self.start_x_cell = int(start_x)
+        self.start_y_cell = int(start_y)
+        self.configured_start_heading = int(start_heading)
 
         # =====================================================
         # ROS PUBLISHER / SUBSCRIBERS
@@ -87,6 +84,7 @@ class GridRLController(Node):
 
         self.forward_speed = 0.12
         self.turn_speed = 0.30
+        self.turn_speed_linear = 0.08
 
         self.position_tolerance = 0.02
         self.lateral_tolerance = 0.04
@@ -121,8 +119,8 @@ class GridRLController(Node):
         # GRID / STATE TRACKING
         # =====================================================
 
-        self.current_cell = (0, 0)
-        self.heading = self.EAST
+        self.current_cell = (self.start_x_cell, self.start_y_cell)
+        self.heading = self.configured_start_heading
 
         self.state = 'WAITING'
 
@@ -253,7 +251,7 @@ class GridRLController(Node):
         )
 
         self.scan_received = True
-        
+
         self.get_logger().info(
             f"Distances -> "
             f"Front={self.front_distance:.2f} "
@@ -330,17 +328,34 @@ class GridRLController(Node):
     # =========================================================
 
     def get_current_walls(self):
+
         front_dir = self.heading
         left_dir = self.left_direction(self.heading)
         right_dir = self.right_direction(self.heading)
         back_dir = (self.heading + 2) % 4
 
-        return {
+        self.get_logger().info(
+            f"Distances : "
+            f"F={self.front_distance:.3f} "
+            f"L={self.left_distance:.3f} "
+            f"R={self.right_distance:.3f} "
+            f"B={self.back_distance:.3f}"
+        )
+
+        self.get_logger().info(
+            f"Threshold = {self.wall_threshold:.2f}"
+        )
+
+        walls = {
             front_dir: self.front_distance <= self.wall_threshold,
             left_dir: self.left_distance <= self.wall_threshold,
             right_dir: self.right_distance <= self.wall_threshold,
             back_dir: self.back_distance <= self.wall_threshold
         }
+
+        self.get_logger().info(f"Walls = {walls}")
+
+        return walls
 
     # =========================================================
     # EXECUTION API CALLED BY RL POLICY SCRIPT
@@ -365,14 +380,30 @@ class GridRLController(Node):
 
         if abs(angle_error) <= self.angle_tolerance:
             self.stop_robot()
+
             self.heading = self.target_heading
             self.locked_yaw = target_yaw
+
             self.state = 'MOVING'
+
             return
 
+        # Ackermann-compatible turning.
+        # The car cannot rotate in place, so move slowly
+        # while commanding a proportional yaw rate.
         cmd = Twist()
-        cmd.linear.x = 0.0
-        cmd.angular.z = self.turn_speed if angle_error > 0.0 else -self.turn_speed
+
+        cmd.linear.x = self.turn_speed_linear
+
+        turn_rate = 1.5 * angle_error
+
+        turn_rate = max(
+            -0.30,
+            min(0.30, turn_rate)
+        )
+
+        cmd.angular.z = turn_rate
+
         self.cmd_pub.publish(cmd)
 
     def execute_move(self):
@@ -405,8 +436,13 @@ class GridRLController(Node):
 
         if arrival_condition_met:
             self.stop_robot()
+
             previous_cell = self.current_cell
             self.current_cell = self.target_cell
+
+            self.get_logger().info(
+                f"ODOM=({self.x:.3f},{self.y:.3f})  CELL={self.current_cell}"
+            )
 
             self.get_logger().info(f'ARRIVED AT CENTER: {previous_cell} -> {self.current_cell}')
 
