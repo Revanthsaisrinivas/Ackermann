@@ -303,4 +303,3 @@ def generate_launch_description():
     return LaunchDescription([
         OpaqueFunction(function=launch_setup)
     ])
-    

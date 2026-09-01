@@ -355,25 +355,36 @@ class MazeEnvironment:
 
         self.current_steps += 1
 
-        # Check the actual movement against the hidden ground-truth maze.
-        # The RL agent does not see blocked_edges directly.
+        # The robot turns to face `action`'s direction and its
+        # sensors read the cell it's currently standing in. This is
+        # the "sensing" step -- it happens before we know whether the
+        # move itself will succeed, and it only ever tells the robot
+        # about the cell it's already in, never the destination cell.
+        self.heading = action
+        self.scan_current_cell()
+
+        # --- (1) "Can the agent choose this action?" is answered
+        # separately and only informationally, via
+        # get_valid_actions() / get_discovered_valid_actions(), which
+        # a training loop can consult to mask/bias action selection.
+        # step() itself does not use discovered knowledge to reject
+        # actions -- if it did, the INVALID_MOVE_PENALTY could never
+        # fire and the agent could never learn from a genuine mistake.
+        #
+        # --- (2) "Did the robot actually hit a wall?" is answered
+        # purely from ground truth (is_valid_move / blocked_edges),
+        # never from discovered_walls.
         if not self.is_valid_move(action):
             reward = self.compute_reward(
                 action_valid=False,
                 already_visited=False,
                 reached_goal=False
             )
-
             done = self.current_steps >= self.max_steps
-
             if done:
                 reward = self.TIMEOUT_PENALTY
 
-            # Stay in the same cell and keep the previous heading.
             return self.get_state(), reward, done
-
-        # Movement is valid, so now update the robot's heading.
-        self.heading = action
 
         x, y = self.robot
         dx, dy = self.DELTA[action]
@@ -386,7 +397,8 @@ class MazeEnvironment:
         self.robot = new_position
         self.visited.add(new_position)
 
-        # Scan only after entering the new cell.
+        # Sense the newly-entered cell (no-op if already scanned on a
+        # previous visit).
         self.scan_current_cell()
 
         reward = self.compute_reward(
