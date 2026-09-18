@@ -1,0 +1,20 @@
+# ROS 2 / colcon build artefacts
+build/
+install/
+log/
+
+# DRL virtualenv (~900 MB - never commit this)
+.venv-drl/
+
+# Python
+__pycache__/
+*.py[cod]
+
+# Training output
+runs/
+tensorboard/
+*.zip.tmp
+
+# The canonical Q-table lives at $RL_Q_TABLE, default
+# ~/.ros/rl_ackermann/q_table.pkl - outside the workspace on purpose.
+# See robot_controller/q_table_path.py

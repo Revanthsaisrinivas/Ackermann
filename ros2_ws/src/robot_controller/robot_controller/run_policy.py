@@ -1,396 +1,1141 @@
 #!/usr/bin/env python3
-
 """
-Run (and keep training) a Q-learning policy on the maze using the
-ROS2 GridRLController.
+Run the trained Q-Learning policy in Gazebo (or on the real robot).
 
-Responsibilities:
+State format (7 values, maze-independent):
 
-    Gazebo launch:
-        - Starts Gazebo
-        - Spawns rl_robot
-        - Sets the initial world pose
-        (this script does NOT do any of that -- see note below)
+(
+    dx,            # goal_x - robot_x
+    dy,            # goal_y - robot_y
+    heading,
+    east_wall,
+    north_wall,
+    west_wall,
+    south_wall
+)
 
-    GridRLController:
-        - Reads /scan, /odom
-        - Controls /cmd_vel
-        - Executes movement
-        - get_current_walls() reports what the LIDAR actually senses
-          at the robot's CURRENT cell -- there is no ground-truth
-          wall table anywhere in that file, so this is genuinely
-          "unknown map" sensing, not a simulated stand-in for it.
+Action priority when Q-values are equal:
 
-    run_policy.py (this file):
-        - Prompts on the keyboard for start cell/heading AND goal
-          cell (previously these came from ROS parameters with silent
-          defaults of (0,0)/(4,4), which is why the controller kept
-          starting from 0,0 regardless of what was actually spawned)
-        - Builds state the SAME way rl_environment.py's unknown-map
-          MazeEnvironment does: (cell_x, cell_y, goal_x, goal_y,
-          heading, front_wall, left_wall, right_wall, back_wall) --
-          the wall bits come from robot.get_current_walls(), i.e. the
-          real sensor, never from a simulated/ground-truth table
-        - Selects actions epsilon-greedy and keeps training live
-          (agent.update_q_table() every step), same as the earlier
-          agreed design -- this was previously pure greedy replay
-          with no learning happening at all
-        - Loads/saves the same q_table.pkl train.py uses, so learning
-          accumulates across simulated AND real/Gazebo runs
+EAST -> NORTH -> WEST -> SOUTH
 
-IMPORTANT: this script NEVER spawns or deletes the robot. Gazebo must
-already be running (via gazebo.launch.py, launched separately) with
-rl_robot already spawned before you run this.
+IMPORTANT: this script never has access to a "true" maze layout.
+The robot only knows its own estimated cell (from odometry), the
+goal cell it was told, and what its LIDAR currently sees. That is
+what makes this work in an environment nobody trained on directly
+(e.g. an instructor's chairs) as long as the Q-table was trained
+with domain randomization (see train.py).
 """
 
-from ament_index_python.packages import get_package_share_directory
-
+import argparse
 import os
-import sys
-import time
 
 import rclpy
 
 from .rl_environment import MazeEnvironment
-from .q_learning import QLearningAgent
+from .q_learning import QLearningAgent, STATE_FORMAT
 from .grid_rl_controller import GridRLController
-
-
-# =========================================================
-# CONFIGURATION
-# =========================================================
-
-Q_TABLE_FILE = os.path.join(
-    get_package_share_directory("robot_controller"),
-    "q_table.pkl"
+from .maze_memory import MazeMemory
+from .q_table_path import (
+    ENV_VAR,
+    describe_q_table_source,
+    q_table_path,
 )
 
-GRID_WIDTH = MazeEnvironment.GRID_SIZE
-GRID_HEIGHT = MazeEnvironment.GRID_SIZE
 
-MAX_STEPS = 200
+# ============================================================
+# CONFIGURATION
+# ============================================================
 
-# Real actions take real seconds (turn + drive a full cell) --
-# without a cap here a stuck controller would hang this script
-# forever instead of erroring out.
-STEP_TIMEOUT_SEC = 30.0
-STARTUP_TIMEOUT_SEC = 30.0
+# Resolved once, in q_table_path.py, and shared with train.py.
+# This used to search three candidate locations in an order that
+# did not match where train.py saved, so the policy could silently
+# load a stale table. There is now exactly one file. See
+# q_table_path.py.
+Q_TABLE_FILE = q_table_path()
 
-HEADING_NAMES = {0: "EAST", 1: "NORTH", 2: "WEST", 3: "SOUTH"}
+MAX_STEPS = 100
 
-
-# =========================================================
-# KEYBOARD INPUT
-# =========================================================
-# Replaces the old ROS-parameter-based start_x/start_y/start_heading/
-# goal_x/goal_y (which silently defaulted to (0,0) and (4,4) if never
-# overridden on the command line -- the direct cause of "the
-# controller keeps starting from 0,0"). Prompted here instead, the
-# same way gazebo.launch.py now prompts for the spawn cell -- ENTER
-# THE SAME START CELL/HEADING YOU USED WHEN LAUNCHING GAZEBO, or the
-# controller's internal cell-tracking will disagree with where the
-# robot actually is in the physics world.
-
-def prompt_cell(label):
-    while True:
-        raw = input(f"{label} (x y, space-separated, 0-{GRID_WIDTH - 1}): ")
-        parts = raw.split()
-        if len(parts) != 2:
-            print("  Enter two integers separated by a space, e.g. '2 2'.")
-            continue
-        try:
-            x, y = int(parts[0]), int(parts[1])
-        except ValueError:
-            print("  Both values must be integers.")
-            continue
-        if 0 <= x < GRID_WIDTH and 0 <= y < GRID_HEIGHT:
-            return (x, y)
-        print(f"  Both values must be in 0-{GRID_WIDTH - 1}.")
+# Names of the 7 state elements, in order. Used only to check that a
+# loaded Q-table is keyed the same way the controller asks questions.
+EXPECTED_STATE_SHAPE = (
+    "dx",
+    "dy",
+    "heading",
+    "east",
+    "north",
+    "west",
+    "south",
+)
 
 
-def prompt_heading():
-    while True:
-        raw = input("Start heading (0=EAST, 1=NORTH, 2=WEST, 3=SOUTH): ")
-        try:
-            heading = int(raw)
-        except ValueError:
-            print("  Enter a single integer 0-3.")
-            continue
-        if heading in HEADING_NAMES:
-            return heading
-        print("  Must be one of 0, 1, 2, 3.")
+# ============================================================
+# ACTION PRIORITY
+#
+# EAST -> NORTH -> WEST -> SOUTH
+# ============================================================
+
+ACTION_PRIORITY = [
+    MazeEnvironment.EAST,
+    MazeEnvironment.NORTH,
+    MazeEnvironment.WEST,
+    MazeEnvironment.SOUTH,
+]
 
 
-# =========================================================
-# STATE / ACTION HELPERS
-# (pure functions, kept separate from the rclpy plumbing below so
-# they can be tested without a live ROS2/Gazebo environment)
-# =========================================================
+# ============================================================
+# ACTION NAMES
+# ============================================================
 
-def get_walls_relative_to_heading(heading, walls_by_direction, left_dir, right_dir, back_dir):
-    """
-    Lay out the controller's live wall booleans as
-    (front, left, right, back) relative to heading -- the exact order
-    rl_environment.py's get_state() uses -- so state tuples built here
-    are directly compatible with a Q-table trained in simulation.
-    """
-    return (
-        int(walls_by_direction[heading]),
-        int(walls_by_direction[left_dir]),
-        int(walls_by_direction[right_dir]),
-        int(walls_by_direction[back_dir]),
+ACTION_NAMES = {
+    MazeEnvironment.EAST: "EAST",
+    MazeEnvironment.NORTH: "NORTH",
+    MazeEnvironment.WEST: "WEST",
+    MazeEnvironment.SOUTH: "SOUTH",
+}
+
+
+def action_name(action):
+
+    return ACTION_NAMES.get(
+        action,
+        f"UNKNOWN({action})"
     )
 
 
-def get_valid_actions(cell, walls_by_direction, direction_delta):
-    """
-    Same semantics as MazeEnvironment.get_discovered_valid_actions():
-    a direction is available if it's in-bounds AND the controller's
-    live scan didn't just mark it blocked. The real robot fully
-    (re)senses its current cell every time it's standing in it (see
-    GridRLController.get_current_walls()), so this is never
-    "cheating" -- it's the discovered-map model, just backed by a
-    real sensor instead of a simulated one.
-    """
-    actions = []
-    for action, (dx, dy) in direction_delta.items():
-        if walls_by_direction.get(action, False):
-            continue
-        nx, ny = cell[0] + dx, cell[1] + dy
-        if 0 <= nx < GRID_WIDTH and 0 <= ny < GRID_HEIGHT:
-            actions.append(action)
-    return actions
+# ============================================================
+# LIDAR-ONLY FALLBACK
+#
+# Used only when the current state was never seen during
+# training. This must NOT use any knowledge of the true maze
+# layout (the real maze is unknown), so it works purely off:
+#
+#   - dx, dy   -> relative goal direction (already known: the
+#                 goal cell was given to the robot, and the
+#                 robot's own cell comes from odometry)
+#   - valid_actions -> directions LIDAR currently reports open
+#
+# Strategy: prefer whichever open direction reduces the
+# distance to the goal, tie-broken EAST -> NORTH -> WEST -> SOUTH.
+# If no open direction reduces distance (goal is "behind" a
+# wall), fall back to plain priority order among open directions.
+# ============================================================
+
+def lidar_greedy_fallback(dx, dy, valid_actions):
+
+    preferred = set()
+
+    if dx > 0:
+        preferred.add(MazeEnvironment.EAST)
+    elif dx < 0:
+        preferred.add(MazeEnvironment.WEST)
+
+    if dy > 0:
+        preferred.add(MazeEnvironment.NORTH)
+    elif dy < 0:
+        preferred.add(MazeEnvironment.SOUTH)
+
+    for action in ACTION_PRIORITY:
+
+        if action in preferred and action in valid_actions:
+
+            return action
+
+    # Nothing moves us closer right now (e.g. goal direction is
+    # walled off) - just take the highest-priority open direction.
+    for action in ACTION_PRIORITY:
+
+        if action in valid_actions:
+
+            return action
+
+    return None
 
 
-def build_state(cell, goal, heading, front, left, right, back):
-    return (cell[0], cell[1], goal[0], goal[1], heading, front, left, right, back)
+# ============================================================
+# LOAD Q-TABLE
+# ============================================================
 
+def load_agent():
 
-def read_walls(robot):
-    """Returns (walls_by_direction dict, front, left, right, back)."""
-    walls_by_direction = robot.get_current_walls()
-    left_dir = robot.left_direction(robot.heading)
-    right_dir = robot.right_direction(robot.heading)
-    back_dir = (robot.heading + 2) % 4
-    front, left, right, back = get_walls_relative_to_heading(
-        robot.heading, walls_by_direction, left_dir, right_dir, back_dir
+    if not os.path.isfile(Q_TABLE_FILE):
+
+        raise FileNotFoundError(
+            "\nQ-table not found:\n"
+            f"{Q_TABLE_FILE}\n"
+            "\nThis is the only location that is consulted - there is\n"
+            "no fallback search any more. Either train one:\n"
+            "    python3 -m robot_controller.train\n"
+            f"or point {ENV_VAR} at an existing table:\n"
+            f"    export {ENV_VAR}=/path/to/q_table.pkl\n"
+        )
+
+    agent = QLearningAgent(
+
+        actions=MazeEnvironment.ACTIONS,
+
+        learning_rate=0.1,
+
+        discount_factor=0.95,
+
+        epsilon=0.0,
+
+        epsilon_decay=1.0,
+
+        epsilon_min=0.0,
     )
-    return walls_by_direction, front, left, right, back
 
+    agent.load(Q_TABLE_FILE)
 
-def wait_until(robot, predicate, timeout_sec, description):
-    deadline = time.time() + timeout_sec
-    while time.time() < deadline:
-        rclpy.spin_once(robot, timeout_sec=0.1)
-        if predicate(robot):
-            return True
-    robot.get_logger().warning(f"Timed out waiting for: {description}")
-    return False
+    # Absolutely disable exploration.
+    agent.epsilon = 0.0
 
+    if not agent.q_table:
 
-# =========================================================
-# POLICY
-# =========================================================
+        raise RuntimeError(
+            "Q-table is empty."
+        )
 
-def run_policy(start, goal, start_heading, agent):
-    """
-    IMPORTANT: GridRLController DOES NOT spawn the robot.
-    gazebo.launch.py must already have spawned rl_robot.
-    """
+    # ========================================================
+    # STATE-FORMAT GUARD
+    #
+    # A table keyed on a different state encoding is not empty
+    # and not undertrained - every single lookup just misses,
+    # and the policy quietly runs on its fallback for the whole
+    # episode while still printing "Q-TABLE LOADED / States:
+    # 2456". That is exactly what this workspace was doing:
+    # the saved table used the old 9-tuple absolute encoding
+    # while the controller emits the 7-tuple relative one.
+    # Fail loudly instead.
+    # ========================================================
 
-    if not rclpy.ok():
-        rclpy.init()
+    sample_state = next(iter(agent.q_table))
 
-    robot = GridRLController(
-        start_x=start[0],
-        start_y=start[1],
-        start_heading=start_heading
+    if (
+        agent.state_format is not None
+        and
+        agent.state_format != STATE_FORMAT
+    ):
+
+        raise RuntimeError(
+            "\nQ-TABLE STATE FORMAT MISMATCH\n"
+            f"  file     : {Q_TABLE_FILE}\n"
+            f"  saved as : {agent.state_format}\n"
+            f"  expected : {STATE_FORMAT}\n"
+            f"  key seen : {sample_state} ({len(sample_state)} elements)\n"
+            "\nThis table was trained with a different state encoding, so\n"
+            "every lookup would miss and the policy would silently run on\n"
+            "the exploration fallback alone. Retrain:\n"
+            "    python3 -m robot_controller.train\n"
+        )
+
+    if len(sample_state) != len(EXPECTED_STATE_SHAPE):
+
+        raise RuntimeError(
+            "\nQ-TABLE STATE ARITY MISMATCH\n"
+            f"  file     : {Q_TABLE_FILE}\n"
+            f"  key seen : {sample_state} ({len(sample_state)} elements)\n"
+            f"  expected : {len(EXPECTED_STATE_SHAPE)} elements "
+            f"{EXPECTED_STATE_SHAPE}\n"
+            "\nRetrain:\n"
+            "    python3 -m robot_controller.train\n"
+        )
+
+    print()
+
+    print("=" * 60)
+    print("Q-TABLE LOADED")
+    print("=" * 60)
+
+    print(
+        f"File: {describe_q_table_source(Q_TABLE_FILE)}"
     )
 
-    robot.get_logger().info("========== POLICY EXECUTION ==========")
-    robot.get_logger().info(f"Start   : {start}")
-    robot.get_logger().info(f"Goal    : {goal}")
-    robot.get_logger().info(
-        f"Heading : {HEADING_NAMES.get(start_heading, 'UNKNOWN')}"
+    print(
+        f"States: {len(agent.q_table)}"
     )
+
+    print()
+
+    print(
+        "Mode: Q-TABLE + LIDAR-ONLY FALLBACK"
+    )
+
+    print(
+        "Tie priority:"
+    )
+
+    print(
+        "EAST -> NORTH -> WEST -> SOUTH"
+    )
+
+    print("=" * 60)
+
+    return agent
+
+
+# ============================================================
+# SELECT BEST ACTION
+#
+# Only valid/open actions (as reported by LIDAR right now) are
+# considered. If Q-values are equal:
+#
+# EAST -> NORTH -> WEST -> SOUTH
+# ============================================================
+
+def select_policy_action(
+    agent,
+    state,
+    valid_actions
+):
+
+    if not valid_actions:
+
+        return None
+
+    # Ensure priority order.
+    ordered_actions = [
+
+        action
+
+        for action in ACTION_PRIORITY
+
+        if action in valid_actions
+
+    ]
+
+    if not ordered_actions:
+
+        return None
+
+    # ========================================================
+    # STATE EXISTS
+    # ========================================================
+
+    if state in agent.q_table:
+
+        q_values = agent.q_table[state]
+
+        print()
+        print("Q-values for this state:")
+        for action in ACTION_PRIORITY:
+            if action in valid_actions:
+                print(f"  {action_name(action)} = {q_values[action]:.12f}")
+
+        best_action = ordered_actions[0]
+        best_value = q_values[best_action]
+        tolerance = 1e-9
+
+        for action in ordered_actions[1:]:
+
+            q_value = q_values[action]
+
+            # Equal values retain the earlier priority order.
+            if abs(q_value - best_value) <= tolerance:
+                continue
+
+            if q_value > best_value + tolerance:
+
+                best_value = q_value
+                best_action = action
+
+        print(f"Selected action by Q-value rule: {action_name(best_action)}")
+
+        # Explicit tie detection for debugging.
+        same_value_actions = []
+        for action in ordered_actions:
+            if abs(q_values[action] - best_value) <= tolerance:
+                same_value_actions.append(action)
+
+        if len(same_value_actions) > 1:
+            print("Tie detected among actions: " + ", ".join(action_name(a) for a in same_value_actions))
+            print("Priority order kept the earlier one: " + action_name(best_action))
+
+        return best_action
+
+    # ========================================================
+    # STATE NOT FOUND -> LIDAR-ONLY GREEDY FALLBACK
+    #
+    # We deliberately do NOT consult the training maze here.
+    # The real maze is unknown, so the only information we are
+    # allowed to use is the relative goal direction and what
+    # LIDAR currently reports as open.
+    # ========================================================
+
+    print()
+
+    print("=" * 60)
+
+    print(
+        "WARNING: STATE NOT FOUND IN Q-TABLE"
+    )
+
+    print("=" * 60)
+
+    print(
+        f"State: {state}"
+    )
+
+    print()
+
+    dx, dy = state[0], state[1]
+
+    fallback_action = lidar_greedy_fallback(dx, dy, valid_actions)
+
+    if fallback_action is not None:
+        print(
+            "Using LIDAR-only greedy fallback (toward goal direction, "
+            "tie-break EAST -> NORTH -> WEST -> SOUTH):"
+        )
+        print(
+            f"{action_name(fallback_action)}"
+        )
+        print()
+        return fallback_action
+
+    print(
+        "Using priority fallback:"
+    )
+
+    print(
+        "EAST -> NORTH -> WEST -> SOUTH"
+    )
+
+    print()
+
+    return ordered_actions[0]
+
+
+# ============================================================
+# PRINT SENSOR WALLS
+# ============================================================
+
+def print_sensor_walls(walls):
+
+    print(
+        "Sensor walls:"
+    )
+
+    for action in ACTION_PRIORITY:
+
+        if walls[action]:
+
+            status = "BLOCKED"
+
+        else:
+
+            status = "OPEN"
+
+        print(
+
+            f"  {action_name(action)}: "
+
+            f"{status}"
+
+        )
+
+
+# ============================================================
+# EXECUTE POLICY
+# ============================================================
+
+def execute_policy(
+
+    start,
+
+    goal,
+
+    start_heading,
+
+    agent
+
+):
+
+    robot = None
+
+    total_reward = 0
 
     try:
-        print("Waiting for the controller to finish its startup scan...")
-        ready = wait_until(
-            robot,
-            lambda r: r.initialized and r.state == "IDLE",
-            STARTUP_TIMEOUT_SEC,
-            "controller startup (scan_received/odom_received/initial scan)"
+
+        # ====================================================
+        # INITIALIZE ROS
+        # ====================================================
+
+        rclpy.init()
+
+        # ====================================================
+        # CREATE CONTROLLER
+        # ====================================================
+
+        robot = GridRLController()
+
+        # ====================================================
+        # WAIT FOR SENSORS
+        # ====================================================
+
+        print()
+
+        print("=" * 60)
+        print("UNKNOWN MAZE RL NAVIGATION")
+        print("=" * 60)
+
+        print(
+            f"Start: {start}"
         )
-        if not ready:
-            print(
-                "Controller never reached IDLE after startup -- check that "
-                "Gazebo is actually running with rl_robot already spawned "
-                "and /scan, /odom are publishing "
-                "(ros2 topic hz /scan, ros2 topic hz /odom)."
+
+        print(
+            f"Goal: {goal}"
+        )
+
+        print(
+            "Initial orientation: "
+            f"{action_name(start_heading)}"
+        )
+
+        print()
+
+        print(
+            "The initial heading is physical orientation only."
+        )
+
+        print(
+            "Movement is selected only from "
+            "sensor-confirmed OPEN directions."
+        )
+
+        print()
+
+        print(
+            "Controller movement sequence:"
+        )
+
+        print(
+            "CENTER -> TURN -> MOVE -> CENTER -> SCAN"
+        )
+
+        print()
+
+        print(
+            "Waiting for controller and sensors..."
+        )
+
+        # ====================================================
+        # WAIT FOR CONTROLLER
+        # ====================================================
+
+        if not robot.wait_for_ready():
+
+            raise RuntimeError(
+
+                "Controller and sensor initialization timed out."
+
             )
-            return
 
-        if robot.current_cell != start:
-            robot.get_logger().warning(
-                f"Controller initialized at {robot.current_cell}, "
-                f"expected {start} -- this means the cell you entered here "
-                f"doesn't match what Gazebo was actually launched with."
-            )
-        else:
-            robot.get_logger().info(
-                f"Controller correctly initialized at {robot.current_cell}"
-            )
+        # ====================================================
+        # SET START CELL
+        # ====================================================
 
-        total_reward = 0.0
-        reached_goal = False
+        robot.set_start_cell(start)
+        robot.set_heading(start_heading)
 
-        for step_num in range(1, MAX_STEPS + 1):
+        # ====================================================
+        # SET GOAL
+        # ====================================================
 
-            cell_before = robot.current_cell
-            walls_dict, front, left, right, back = read_walls(robot)
-            state = build_state(cell_before, goal, robot.heading, front, left, right, back)
-            valid_actions = get_valid_actions(cell_before, walls_dict, robot.DIRECTION_DELTA)
+        robot.set_goal_cell(goal)
 
-            robot.get_logger().info(f"PATH: Step {step_num}  Cell={cell_before}")
+        # ====================================================
+        # INITIAL SENSOR SCAN
+        # ====================================================
 
-            if cell_before == goal:
+        robot.scan_current_cell()
+
+        print()
+
+        print(
+            "Controller and sensors ready."
+        )
+
+        # ====================================================
+        # MAIN POLICY LOOP
+        # ====================================================
+
+        memory = MazeMemory(MazeEnvironment.GRID_SIZE)
+
+        for step_number in range(
+
+            1,
+
+            MAX_STEPS + 1
+
+        ):
+
+            # =================================================
+            # CURRENT CELL
+            # =================================================
+
+            current_cell = robot.current_cell
+
+            # =================================================
+            # GOAL CHECK
+            # =================================================
+
+            if current_cell == goal:
+
+                print()
+
+                print("=" * 60)
+
+                print(
+                    "GOAL REACHED"
+                )
+
+                print("=" * 60)
+
+                print(
+                    f"Steps: {step_number - 1}"
+                )
+
+                print(
+                    f"Final cell: {current_cell}"
+                )
+
+                print(
+                    f"Total reward: {total_reward}"
+                )
+
                 robot.stop_robot()
-                robot.state = 'FINISHED'
-                robot.get_logger().info("=" * 42)
-                robot.get_logger().info("GOAL REACHED!")
-                robot.get_logger().info(f"Total steps: {step_num - 1}")
-                robot.get_logger().info("=" * 42)
-                reached_goal = True
-                break
+
+                return True
+
+            # =================================================
+            # SCAN CURRENT CELL
+            #
+            # Sensor information is refreshed before choosing
+            # every action.
+            # =================================================
+
+            walls = robot.scan_current_cell()
+
+            if walls is None:
+
+                raise RuntimeError(
+
+                    "Sensor scan failed."
+
+                )
+
+            # =================================================
+            # VALID ACTIONS
+            #
+            # IMPORTANT: pass the SAME `walls` dict taken above.
+            # If this is called with no argument, the controller
+            # scans LIDAR again internally, moments after the
+            # first scan - two independent readings that can
+            # disagree with each other (and with `walls` above)
+            # if the robot hasn't fully settled. That mismatch is
+            # what caused "Sensor walls: NORTH BLOCKED" to appear
+            # next to "Valid actions: [... NORTH ...]" in earlier
+            # runs. One scan per step, reused everywhere below.
+            # =================================================
+
+            valid_actions = robot.get_valid_actions(walls)
 
             if not valid_actions:
-                robot.get_logger().error(
-                    f"No valid actions from {cell_before} -- stuck."
+
+                print()
+
+                print(
+                    "NO VALID ACTIONS AVAILABLE"
                 )
-                break
 
-            action = agent.choose_action(state, valid_actions)
-            target_cell = robot.get_neighbor(cell_before, action)
-
-            robot.get_logger().info(
-                f"Step {step_num}: {cell_before} -> "
-                f"{HEADING_NAMES[action]} -> {target_cell}"
-            )
-
-            robot.execute_action(action, target_cell)
-
-            reached_idle = wait_until(
-                robot,
-                lambda r: r.state == "IDLE",
-                STEP_TIMEOUT_SEC,
-                f"action {HEADING_NAMES[action]} to reach IDLE"
-            )
-
-            if not reached_idle:
-                robot.get_logger().error(
-                    "Controller did not return to IDLE in time; "
-                    "aborting episode."
+                print(
+                    f"Current cell: {current_cell}"
                 )
-                break
 
-            moved = robot.current_cell == target_cell
-            just_reached_goal = robot.current_cell == goal
+                robot.stop_robot()
 
-            if not moved:
-                # Mirrors MazeEnvironment.INVALID_MOVE_PENALTY: the
-                # controller's own emergency-stop logic
-                # (front_distance < emergency_distance) aborted the
-                # move before reaching target_cell.
-                reward = MazeEnvironment.INVALID_MOVE_PENALTY
-                robot.get_logger().warning(
-                    f"Blocked before reaching {target_cell}, reward {reward}"
+                return False
+
+            # =================================================
+            # GET CURRENT STATE
+            #
+            # (dx, dy, heading, east, north, west, south)
+            #
+            # Same `walls` reused again here, for the same reason
+            # as above - one scan, one consistent picture of the
+            # cell, for the whole step.
+            # =================================================
+
+            state = robot.get_state(walls)
+
+            memory.observe(current_cell, walls)
+
+            # =================================================
+            # SELECT ACTION FROM Q-TABLE
+            # =================================================
+
+            # Consult the Q-table only when it actually knows this
+            # state. When it doesn't, hand memory a None and let the
+            # frontier/backtrack rule decide, instead of the old
+            # memoryless greedy fallback that livelocked on dead ends.
+            if state in agent.q_table:
+                q_action = select_policy_action(
+                    agent,
+                    state,
+                    valid_actions,
                 )
-            elif just_reached_goal:
-                reward = MazeEnvironment.GOAL_REWARD
-                robot.get_logger().info(f"Reached goal! reward {reward}")
             else:
-                reward = MazeEnvironment.STEP_PENALTY
+                q_action = None
 
-            done = just_reached_goal or (step_num == MAX_STEPS)
+            action, reason = memory.choose(
+                current_cell,
+                goal,
+                valid_actions,
+                q_action,
+            )
 
-            next_cell = robot.current_cell
-            next_walls_dict, nf, nl, nr, nb = read_walls(robot)
-            next_state = build_state(next_cell, goal, robot.heading, nf, nl, nr, nb)
-            next_valid_actions = get_valid_actions(next_cell, next_walls_dict, robot.DIRECTION_DELTA)
+            if action is None:
 
-            agent.update_q_table(state, action, reward, next_state, next_valid_actions, done)
+                raise RuntimeError(
+                    "No open direction available."
+                )
+
+            # =================================================
+            # PRINT STEP INFORMATION
+            # =================================================
+
+            print()
+
+            print(
+                f"STEP {step_number}"
+            )
+
+            print()
+
+            print(
+                f"Cell: {current_cell}"
+            )
+
+            print(
+                f"Heading: "
+                f"{action_name(robot.heading)}"
+            )
+
+            print(
+                f"State: {state}"
+            )
+
+            print()
+
+            print_sensor_walls(
+
+                walls
+
+            )
+
+            print()
+
+            print(
+
+                "Valid actions: "
+
+                +
+
+                str([
+
+                    action_name(action)
+
+                    for action
+
+                    in valid_actions
+
+                ])
+
+            )
+
+            print()
+
+            print(
+                f"Action: "
+                f"{action_name(action)}  [{reason}]"
+            )
+
+            print(
+                f"Memory: {memory.summary()}"
+            )
+
+            # =================================================
+            # SAVE OLD CELL
+            # =================================================
+
+            old_cell = robot.current_cell
+
+            # =================================================
+            # EXECUTE ACTION
+            #
+            # The controller internally performs:
+            #
+            # TURN
+            # ->
+            # MOVE ONE CELL
+            # ->
+            # UPDATE CELL
+            # ->
+            # SCAN NEW CELL
+            # =================================================
+
+            success = robot.execute_action(
+
+                action,
+
+                walls
+
+            )
+
+            # =================================================
+            # MOVEMENT FAILURE
+            # =================================================
+
+            if not success:
+
+                print()
+
+                print("=" * 60)
+
+                print(
+                    "MOVEMENT FAILED"
+                )
+
+                print("=" * 60)
+
+                print(
+                    f"Action: {action_name(action)}"
+                )
+
+                print(
+                    f"Cell: {old_cell}"
+                )
+
+                reward = (
+
+                    MazeEnvironment
+
+                    .INVALID_MOVE_PENALTY
+
+                )
+
+                total_reward += reward
+
+                print(
+                    f"Reward: {reward}"
+                )
+
+                robot.stop_robot()
+
+                return False
+
+            # =================================================
+            # NEW CELL
+            # =================================================
+
+            new_cell = robot.current_cell
+
+            # =================================================
+            # SAFETY CHECK
+            # =================================================
+
+            if new_cell == old_cell:
+
+                print()
+
+                print(
+                    "Movement failed."
+                )
+
+                print(
+                    "Robot did not enter "
+                    "a new cell."
+                )
+
+                reward = (
+
+                    MazeEnvironment
+
+                    .INVALID_MOVE_PENALTY
+
+                )
+
+                total_reward += reward
+
+                print(
+                    f"Reward: {reward}"
+                )
+
+                robot.stop_robot()
+
+                return False
+
+            # =================================================
+            # GOAL REACHED
+            # =================================================
+
+            if new_cell == goal:
+
+                reward = (
+
+                    MazeEnvironment
+
+                    .GOAL_REWARD
+
+                )
+
+                total_reward += reward
+
+                print()
+
+                print(
+                    f"New cell: {new_cell}"
+                )
+
+                print(
+                    f"Reward: {reward}"
+                )
+
+                print()
+
+                print("=" * 60)
+
+                print(
+                    "GOAL REACHED"
+                )
+
+                print("=" * 60)
+
+                print(
+                    f"Steps: {step_number}"
+                )
+
+                print(
+                    f"Final cell: {new_cell}"
+                )
+
+                print(
+                    f"Total reward: {total_reward}"
+                )
+
+                robot.stop_robot()
+
+                return True
+
+            # =================================================
+            # NORMAL STEP
+            # =================================================
+
+            reward = (
+
+                MazeEnvironment
+
+                .STEP_PENALTY
+
+            )
 
             total_reward += reward
 
-            if just_reached_goal:
-                reached_goal = True
-                break
+            print()
 
-        agent.decay_epsilon()
+            print(
+                f"New cell: {new_cell}"
+            )
 
-        print("\n" + "=" * 50)
-        print("Reached goal" if reached_goal else "Episode ended without reaching goal")
-        print(f"Total reward: {total_reward}")
-        print(f"Epsilon after this episode: {agent.epsilon:.3f}")
-        print("=" * 50)
+            print(
+                f"Reward: {reward}"
+            )
+
+        # ====================================================
+        # MAX STEPS
+        # ====================================================
+
+        print()
+
+        print("=" * 60)
+
+        print(
+            "MAXIMUM STEPS REACHED"
+        )
+
+        print("=" * 60)
+
+        robot.stop_robot()
+
+        return False
 
     except KeyboardInterrupt:
-        robot.get_logger().info("Policy execution interrupted by user.")
+
+        print()
+
+        print(
+            "Navigation interrupted."
+        )
+
+        if robot is not None:
+
+            robot.stop_robot()
+
+        return False
 
     finally:
-        # Only stop the robot. DO NOT delete rl_robot.
-        robot.stop_robot()
-        robot.destroy_node()
+
+        if robot is not None:
+
+            try:
+
+                robot.stop_robot()
+
+            except Exception:
+
+                pass
+
+            try:
+
+                robot.destroy_node()
+
+            except Exception:
+
+                pass
+
         if rclpy.ok():
+
             rclpy.shutdown()
 
 
-# =========================================================
+# ============================================================
+# CLI PARSING
+# ============================================================
+
+def parse_heading(value):
+
+    heading_map = {
+        "EAST": MazeEnvironment.EAST,
+        "NORTH": MazeEnvironment.NORTH,
+        "WEST": MazeEnvironment.WEST,
+        "SOUTH": MazeEnvironment.SOUTH,
+    }
+
+    if isinstance(value, str):
+        key = value.strip().upper()
+        if key in heading_map:
+            return heading_map[key]
+        try:
+            value = int(value)
+        except ValueError as exc:
+            raise argparse.ArgumentTypeError(
+                "Heading must be one of EAST, NORTH, WEST, SOUTH or an integer 0..3."
+            ) from exc
+
+    if value not in MazeEnvironment.ACTIONS:
+        raise argparse.ArgumentTypeError(
+            f"Invalid heading: {value}. Valid headings are {MazeEnvironment.ACTIONS}."
+        )
+
+    return int(value)
+
+
+# ============================================================
 # MAIN
-# =========================================================
+# ============================================================
 
 def main():
-    print("=" * 60)
-    print("Live Q-learning episode against the real/Gazebo robot")
-    print("=" * 60)
-    print(
-        "Make sure Gazebo is ALREADY running (in another terminal) with\n"
-        "rl_robot already spawned at the SAME start cell/heading you're\n"
-        "about to enter here.\n"
+
+    parser = argparse.ArgumentParser(
+        description="Run the trained RL policy in an unknown maze (Gazebo or real robot)."
+    )
+    parser.add_argument(
+        "--start",
+        nargs=2,
+        type=int,
+        metavar=("X", "Y"),
+        required=True,
+        help="Grid start position as X Y.",
+    )
+    parser.add_argument(
+        "--goal",
+        nargs=2,
+        type=int,
+        metavar=("X", "Y"),
+        required=True,
+        help="Grid goal position as X Y.",
+    )
+    parser.add_argument(
+        "--heading",
+        type=parse_heading,
+        default=MazeEnvironment.EAST,
+        help="Initial heading: EAST, NORTH, WEST, SOUTH or 0, 1, 2, 3.",
     )
 
-    start = prompt_cell("Start cell")
-    start_heading = prompt_heading()
-    goal = prompt_cell("Goal cell")
+    args = parser.parse_args()
 
-    if goal == start:
-        print("Goal cell must differ from the start cell. Exiting.")
-        sys.exit(1)
+    start = tuple(args.start)
+    goal = tuple(args.goal)
+    start_heading = args.heading
 
-    agent = QLearningAgent(
-        actions=MazeEnvironment.ACTIONS,
-        learning_rate=0.1,
-        discount_factor=0.95,
-        epsilon=1.0,
-        epsilon_decay=0.995,
-        epsilon_min=0.05
+    if start == goal:
+        parser.error("Start and goal positions must be different.")
+
+    if not (0 <= start[0] < MazeEnvironment.GRID_SIZE and 0 <= start[1] < MazeEnvironment.GRID_SIZE):
+        parser.error(f"Start position {start} is outside the {MazeEnvironment.GRID_SIZE}x{MazeEnvironment.GRID_SIZE} grid.")
+
+    if not (0 <= goal[0] < MazeEnvironment.GRID_SIZE and 0 <= goal[1] < MazeEnvironment.GRID_SIZE):
+        parser.error(f"Goal position {goal} is outside the {MazeEnvironment.GRID_SIZE}x{MazeEnvironment.GRID_SIZE} grid.")
+
+    # ========================================================
+    # LOAD Q-TABLE
+    # ========================================================
+
+    agent = load_agent()
+
+    # ========================================================
+    # EXECUTE POLICY
+    # ========================================================
+
+    success = execute_policy(
+
+        start=start,
+
+        goal=goal,
+
+        start_heading=start_heading,
+
+        agent=agent,
+
     )
 
-    try:
-        agent.load(Q_TABLE_FILE)
+    # ========================================================
+    # FINAL RESULT
+    # ========================================================
+
+    print()
+
+    if success:
+
+        print("=" * 60)
+
         print(
-            f"Loaded existing Q-table ({len(agent.q_table)} states, "
-            f"epsilon={agent.epsilon:.3f}) from {Q_TABLE_FILE}"
+            "NAVIGATION COMPLETED SUCCESSFULLY"
         )
-    except Exception as e:
-        print(f"No usable Q-table at {Q_TABLE_FILE} ({e}); starting fresh.")
 
-    run_policy(start, goal, start_heading, agent)
+        print("=" * 60)
 
-    agent.save(Q_TABLE_FILE)
-    print(f"Q-table saved ({len(agent.q_table)} states) to {Q_TABLE_FILE}")
+    else:
+
+        print("=" * 60)
+
+        print(
+            "NAVIGATION FAILED"
+        )
+
+        print("=" * 60)
 
 
-if __name__ == '__main__':
+if __name__ == "__main__":
+
     main()

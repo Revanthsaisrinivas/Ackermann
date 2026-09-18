@@ -1,677 +1,419 @@
 <?xml version="1.0"?>
+
 <robot name="rl_robot"
        xmlns:xacro="http://www.ros.org/wiki/xacro">
 
   <!-- =====================================================
-       ROBOT GEOMETRY
+       ORIGIN CONVENTION  (changed - read this)
 
-       Hiwonder-style Ackermann chassis:
-         - chassis: 270 x 120.5 x 50 mm model
-         - wheel diameter: 60 mm
-         - wheelbase: 0.18 m
-         - track width: 0.17 m
-         - front axle x = +0.09
-         - rear axle x = -0.09
-         - ground clearance ~ 0.02 m
-  ===================================================== -->
+       base_link / base_footprint sit on the REAR AXLE, not the
+       geometric centre of the plate.
+
+       Why: the robot pivots about whatever point has no lateral
+       scrub. With rear-wheel drive and free-rolling front wheels
+       that point is the rear axle. Odometry, the LIDAR and the
+       pivot centre must all coincide, or every turn injects a
+       position error that grid_rl_controller.py cannot see.
+
+       So: rear wheels at x = 0, front wheels at x = wheelbase,
+       chassis plate and LIDAR offset accordingly.
+
+       This also matches what libgazebo_ros_ackermann_drive
+       expects, so both drive modes use the same frame.
+       ===================================================== -->
+
+  <!-- =====================================================
+       DRIVE MODE SELECTOR
+
+         diff       - rear wheels driven by libgazebo_ros_diff_drive,
+                      front wheels free-rolling and near-frictionless
+                      (they stand in for the old caster). Robot pivots
+                      cleanly about the rear axle.
+
+         ackermann  - true car-like steering. Robot CANNOT pivot in
+                      place; grid_rl_controller.py needs arc / K-turn
+                      primitives first.
+
+       Usage:
+         xacro robot.urdf.xacro drive_mode:=diff
+         xacro robot.urdf.xacro drive_mode:=ackermann
+       ===================================================== -->
+
+  <xacro:arg name="drive_mode" default="diff"/>
+  <xacro:property name="drive_mode" value="$(arg drive_mode)"/>
 
 
-  <!-- ===================================================== -->
-  <!-- BASE FOOTPRINT                                        -->
-  <!-- ===================================================== -->
+  <!-- =====================================================
+       CHASSIS GEOMETRY
+       Ackerman Metal Chassis (ThinkRobotics / Hiwonder)
+       Plate 270 mm x 120.5 mm aluminium.
+       ===================================================== -->
+
+  <xacro:property name="chassis_length" value="0.270"/>
+  <xacro:property name="chassis_width"  value="0.1205"/>
+  <xacro:property name="chassis_height" value="0.045"/>
+  <xacro:property name="chassis_mass"   value="2.5"/>
+
+  <!-- MEASURED -->
+  <xacro:property name="wheelbase"      value="0.213"/>
+  <xacro:property name="track_width"    value="0.222"/>
+  <xacro:property name="wheel_radius"   value="0.0505"/>
+
+  <xacro:property name="wheel_width"    value="0.040"/>
+  <xacro:property name="wheel_mass"     value="0.20"/>
+
+  <!-- STILL TO VERIFY AT THE KNUCKLE, NOT THE SERVO.
+         25 deg -> R = 0.457 m
+         30 deg -> R = 0.369 m   (value used)
+         35 deg -> R = 0.304 m -->
+  <xacro:property name="max_steer"      value="0.5236"/>
+
+  <xacro:property name="ground_clearance" value="0.025"/>
+
+  <!-- Plate centre relative to the rear axle. Overhang is
+       (0.270 - 0.213)/2 = 0.0285 m at each end, so the plate
+       centre sits wheelbase/2 ahead of the rear axle. -->
+  <xacro:property name="chassis_x" value="${wheelbase/2}"/>
+
+  <xacro:property name="chassis_z"
+                  value="${ground_clearance - wheel_radius + chassis_height/2}"/>
+  <xacro:property name="chassis_top"
+                  value="${chassis_z + chassis_height/2}"/>
+
+
+  <!-- =====================================================
+       LIDAR GEOMETRY - RPLIDAR A1M8
+       ===================================================== -->
+
+  <xacro:property name="lidar_radius" value="0.035"/>
+  <xacro:property name="lidar_height" value="0.041"/>
+  <xacro:property name="lidar_mass"   value="0.17"/>
+
+  <!-- Must clear the 101 mm tyres (tops at 0.1010 m). 0.060 m
+       puts the beam plane at 0.1505 m, ~50 mm clear. Maze walls
+       are 0.50 m tall, so that is fine. -->
+  <xacro:property name="lidar_standoff" value="0.060"/>
+
+  <xacro:property name="lidar_z"
+                  value="${chassis_top + lidar_standoff + lidar_height/2}"/>
+
+  <!-- A1M8 is ~1% of range. Set 0.0 for noise-free scans. -->
+  <xacro:property name="lidar_noise_stddev" value="0.01"/>
+
+
+  <!-- =====================================================
+       INERTIA MACROS
+       ===================================================== -->
+
+  <xacro:macro name="box_inertia" params="m x y z x0:=0 y0:=0 z0:=0">
+    <inertial>
+      <origin xyz="${x0} ${y0} ${z0}" rpy="0 0 0"/>
+      <mass value="${m}"/>
+      <inertia
+        ixx="${m*(y*y + z*z)/12.0}"
+        ixy="0.0"
+        ixz="0.0"
+        iyy="${m*(x*x + z*z)/12.0}"
+        iyz="0.0"
+        izz="${m*(x*x + y*y)/12.0}"/>
+    </inertial>
+  </xacro:macro>
+
+  <xacro:macro name="wheel_inertia" params="m r l">
+    <inertial>
+      <origin xyz="0 0 0" rpy="1.5708 0 0"/>
+      <mass value="${m}"/>
+      <inertia
+        ixx="${m*(3.0*r*r + l*l)/12.0}"
+        ixy="0.0"
+        ixz="0.0"
+        iyy="${m*(3.0*r*r + l*l)/12.0}"
+        iyz="0.0"
+        izz="${m*r*r/2.0}"/>
+    </inertial>
+  </xacro:macro>
+
+
+  <!-- =====================================================
+       BASE FOOTPRINT (on the rear axle, projected to ground)
+       ===================================================== -->
 
   <link name="base_footprint"/>
 
   <joint name="base_footprint_joint" type="fixed">
     <parent link="base_footprint"/>
-    <child link="base_link"/>
-
-    <origin
-      xyz="0 0 0.055"
-      rpy="0 0 0"/>
+    <child  link="base_link"/>
+    <origin xyz="0 0 ${wheel_radius}" rpy="0 0 0"/>
   </joint>
 
 
-  <!-- ===================================================== -->
-  <!-- BASE LINK                                             -->
-  <!-- ===================================================== -->
+  <!-- =====================================================
+       BASE LINK
+       ===================================================== -->
 
   <link name="base_link">
 
     <visual>
-      <origin
-        xyz="0 0 0"
-        rpy="0 0 0"/>
-
+      <origin xyz="${chassis_x} 0 ${chassis_z}" rpy="0 0 0"/>
       <geometry>
-        <box size="0.270 0.1205 0.050"/>
+        <box size="${chassis_length} ${chassis_width} ${chassis_height}"/>
       </geometry>
-
       <material name="blue">
         <color rgba="0 0 1 1"/>
       </material>
     </visual>
 
-
     <collision>
-      <origin
-        xyz="0 0 0"
-        rpy="0 0 0"/>
-
+      <origin xyz="${chassis_x} 0 ${chassis_z}" rpy="0 0 0"/>
       <geometry>
-        <box size="0.270 0.1205 0.050"/>
+        <box size="${chassis_length} ${chassis_width} ${chassis_height}"/>
       </geometry>
     </collision>
 
-
-    <inertial>
-      <origin
-        xyz="0 0 0"
-        rpy="0 0 0"/>
-
-      <mass value="2.5"/>
-
-      <inertia
-        ixx="0.003546"
-        ixy="0.0"
-        ixz="0.0"
-        iyy="0.015708"
-        iyz="0.0"
-        izz="0.018213"/>
-    </inertial>
+    <xacro:box_inertia
+      m="${chassis_mass}"
+      x="${chassis_length}"
+      y="${chassis_width}"
+      z="${chassis_height}"
+      x0="${chassis_x}"
+      z0="${chassis_z}"/>
 
   </link>
 
 
-  <!-- ===================================================== -->
-  <!-- VIRTUAL STEERING LINK                                  -->
-  <!-- Required by Ackermann plugin                           -->
-  <!--                                                         -->
-  <!--
-       Tiny 1mm visual sphere added: this link (and the two
-       front_*_steering_link links below) previously had ONLY
-       inertial, no visual/collision at all, the suspected
-       cause of the repeated Ogre AxisAlignedBox crash in
-       gzclient ("min corner must be less than or equal to max
-       corner"): a SceneNode with zero visual geometry can get
-       a degenerate bounding box on some Gazebo/Ogre builds.
-       No collision added, so this doesn't change physics or
-       contact behavior at all.
-  -->
+  <!-- =====================================================
+       WHEEL / KNUCKLE MACROS
+       ===================================================== -->
 
-  <link name="steering_link">
+  <xacro:macro name="wheel_link" params="name">
+    <link name="${name}_link">
 
-    <visual>
-      <origin xyz="0 0 0" rpy="0 0 0"/>
-      <geometry>
-        <sphere radius="0.001"/>
-      </geometry>
-      <material name="steering_marker">
-        <color rgba="1 0 0 1"/>
-      </material>
-    </visual>
+      <visual>
+        <origin xyz="0 0 0" rpy="1.5708 0 0"/>
+        <geometry>
+          <cylinder radius="${wheel_radius}" length="${wheel_width}"/>
+        </geometry>
+        <material name="black">
+          <color rgba="0.05 0.05 0.05 1"/>
+        </material>
+      </visual>
 
-    <inertial>
-      <origin xyz="0 0 0" rpy="0 0 0"/>
+      <collision>
+        <origin xyz="0 0 0" rpy="1.5708 0 0"/>
+        <geometry>
+          <cylinder radius="${wheel_radius}" length="${wheel_width}"/>
+        </geometry>
+      </collision>
 
-      <mass value="0.001"/>
+      <xacro:wheel_inertia
+        m="${wheel_mass}"
+        r="${wheel_radius}"
+        l="${wheel_width}"/>
 
-      <inertia
-        ixx="0.000001"
-        ixy="0.0"
-        ixz="0.0"
-        iyy="0.000001"
-        iyz="0.0"
-        izz="0.000001"/>
-    </inertial>
+    </link>
+  </xacro:macro>
 
-  </link>
+  <xacro:macro name="knuckle_link" params="name">
+    <link name="${name}_link">
+      <visual>
+        <origin xyz="0 0 0" rpy="0 0 0"/>
+        <geometry>
+          <box size="0.02 0.02 0.03"/>
+        </geometry>
+        <material name="knuckle_gray">
+          <color rgba="0.4 0.4 0.4 1"/>
+        </material>
+      </visual>
+      <xacro:box_inertia m="0.05" x="0.02" y="0.02" z="0.03"/>
+    </link>
+  </xacro:macro>
 
 
-  <joint name="steering_joint" type="revolute">
+  <xacro:wheel_link name="front_left_wheel"/>
+  <xacro:wheel_link name="front_right_wheel"/>
+  <xacro:wheel_link name="rear_left_wheel"/>
+  <xacro:wheel_link name="rear_right_wheel"/>
 
+  <xacro:knuckle_link name="front_left_knuckle"/>
+  <xacro:knuckle_link name="front_right_knuckle"/>
+
+
+  <!-- =====================================================
+       REAR AXLE - at the origin, driven in both modes
+       ===================================================== -->
+
+  <joint name="rear_left_wheel_joint" type="continuous">
     <parent link="base_link"/>
-    <child link="steering_link"/>
-
-    <origin
-      xyz="0 0 0.05"
-      rpy="0 0 0"/>
-
-    <axis xyz="0 0 1"/>
-
-    <limit
-      lower="-7.85"
-      upper="7.85"
-      effort="10"
-      velocity="10"/>
-
-  </joint>
-
-
-  <!-- ===================================================== -->
-  <!-- FRONT LEFT STEERING + WHEEL                            -->
-  <!-- ===================================================== -->
-
-  <link name="front_left_steering_link">
-
-    <visual>
-      <origin xyz="0 0 0" rpy="0 0 0"/>
-      <geometry>
-        <sphere radius="0.001"/>
-      </geometry>
-      <material name="steering_marker">
-        <color rgba="1 0 0 1"/>
-      </material>
-    </visual>
-
-    <inertial>
-      <origin xyz="0 0 0" rpy="0 0 0"/>
-
-      <mass value="0.05"/>
-
-      <inertia
-        ixx="0.00001"
-        ixy="0.0"
-        ixz="0.0"
-        iyy="0.00001"
-        iyz="0.0"
-        izz="0.00001"/>
-    </inertial>
-
-  </link>
-
-
-  <joint
-    name="front_left_steering_joint"
-    type="revolute">
-
-    <parent link="base_link"/>
-    <child link="front_left_steering_link"/>
-
-    <origin
-      xyz="0.09 0.085 -0.03"
-      rpy="0 0 0"/>
-
-    <axis xyz="0 0 1"/>
-
-    <limit
-      lower="-0.6"
-      upper="0.6"
-      effort="10"
-      velocity="5"/>
-
-    <dynamics
-      damping="0.05"
-      friction="0.05"/>
-
-  </joint>
-
-
-  <link name="front_left_wheel_link">
-
-    <visual>
-      <origin
-        xyz="0 0 0"
-        rpy="1.5708 0 0"/>
-
-      <geometry>
-        <cylinder
-          radius="0.03"
-          length="0.02"/>
-      </geometry>
-
-      <material name="black">
-        <color rgba="0.05 0.05 0.05 1"/>
-      </material>
-    </visual>
-
-
-    <collision>
-      <origin
-        xyz="0 0 0"
-        rpy="1.5708 0 0"/>
-
-      <geometry>
-        <cylinder
-          radius="0.03"
-          length="0.02"/>
-      </geometry>
-    </collision>
-
-
-    <inertial>
-      <origin xyz="0 0 0" rpy="0 0 0"/>
-
-      <mass value="0.15"/>
-
-      <inertia
-        ixx="0.0001"
-        ixy="0.0"
-        ixz="0.0"
-        iyy="0.0001"
-        iyz="0.0"
-        izz="0.0001"/>
-    </inertial>
-
-  </link>
-
-
-  <joint
-    name="front_left_wheel_joint"
-    type="continuous">
-
-    <parent link="front_left_steering_link"/>
-    <child link="front_left_wheel_link"/>
-
-    <origin
-      xyz="0 0 0"
-      rpy="0 0 0"/>
-
+    <child  link="rear_left_wheel_link"/>
+    <origin xyz="0 ${track_width/2} 0" rpy="0 0 0"/>
     <axis xyz="0 1 0"/>
-
-    <dynamics
-      damping="0.1"
-      friction="0.1"/>
-
+    <dynamics damping="0.05" friction="0.02"/>
   </joint>
 
-
-  <!-- ===================================================== -->
-  <!-- FRONT RIGHT STEERING + WHEEL                           -->
-  <!-- ===================================================== -->
-
-  <link name="front_right_steering_link">
-
-    <visual>
-      <origin xyz="0 0 0" rpy="0 0 0"/>
-      <geometry>
-        <sphere radius="0.001"/>
-      </geometry>
-      <material name="steering_marker">
-        <color rgba="1 0 0 1"/>
-      </material>
-    </visual>
-
-    <inertial>
-      <origin xyz="0 0 0" rpy="0 0 0"/>
-
-      <mass value="0.05"/>
-
-      <inertia
-        ixx="0.00001"
-        ixy="0.0"
-        ixz="0.0"
-        iyy="0.00001"
-        iyz="0.0"
-        izz="0.00001"/>
-    </inertial>
-
-  </link>
-
-
-  <joint
-    name="front_right_steering_joint"
-    type="revolute">
-
+  <joint name="rear_right_wheel_joint" type="continuous">
     <parent link="base_link"/>
-    <child link="front_right_steering_link"/>
-
-    <origin
-      xyz="0.09 -0.085 -0.03"
-      rpy="0 0 0"/>
-
-    <axis xyz="0 0 1"/>
-
-    <limit
-      lower="-0.6"
-      upper="0.6"
-      effort="10"
-      velocity="5"/>
-
-    <dynamics
-      damping="0.05"
-      friction="0.05"/>
-
-  </joint>
-
-
-  <link name="front_right_wheel_link">
-
-    <visual>
-      <origin
-        xyz="0 0 0"
-        rpy="1.5708 0 0"/>
-
-      <geometry>
-        <cylinder
-          radius="0.03"
-          length="0.02"/>
-      </geometry>
-
-      <material name="black">
-        <color rgba="0.05 0.05 0.05 1"/>
-      </material>
-    </visual>
-
-
-    <collision>
-      <origin
-        xyz="0 0 0"
-        rpy="1.5708 0 0"/>
-
-      <geometry>
-        <cylinder
-          radius="0.03"
-          length="0.02"/>
-      </geometry>
-    </collision>
-
-
-    <inertial>
-      <origin xyz="0 0 0" rpy="0 0 0"/>
-
-      <mass value="0.15"/>
-
-      <inertia
-        ixx="0.0001"
-        ixy="0.0"
-        ixz="0.0"
-        iyy="0.0001"
-        iyz="0.0"
-        izz="0.0001"/>
-    </inertial>
-
-  </link>
-
-
-  <joint
-    name="front_right_wheel_joint"
-    type="continuous">
-
-    <parent link="front_right_steering_link"/>
-    <child link="front_right_wheel_link"/>
-
-    <origin
-      xyz="0 0 0"
-      rpy="0 0 0"/>
-
+    <child  link="rear_right_wheel_link"/>
+    <origin xyz="0 ${-track_width/2} 0" rpy="0 0 0"/>
     <axis xyz="0 1 0"/>
-
-    <dynamics
-      damping="0.0"
-      friction="0.0"/>
-
+    <dynamics damping="0.05" friction="0.02"/>
   </joint>
 
 
-  <!-- ===================================================== -->
-  <!-- REAR LEFT WHEEL                                       -->
-  <!-- ===================================================== -->
+  <!-- =====================================================
+       FRONT STEERING JOINTS
+       ===================================================== -->
 
-  <link name="rear_left_wheel_link">
+  <xacro:if value="${drive_mode == 'diff'}">
 
-    <visual>
-      <origin
-        xyz="0 0 0"
-        rpy="1.5708 0 0"/>
+    <joint name="front_left_steering_joint" type="fixed">
+      <parent link="base_link"/>
+      <child  link="front_left_knuckle_link"/>
+      <origin xyz="${wheelbase} ${track_width/2} 0" rpy="0 0 0"/>
+    </joint>
 
-      <geometry>
-        <cylinder
-          radius="0.03"
-          length="0.02"/>
-      </geometry>
+    <joint name="front_right_steering_joint" type="fixed">
+      <parent link="base_link"/>
+      <child  link="front_right_knuckle_link"/>
+      <origin xyz="${wheelbase} ${-track_width/2} 0" rpy="0 0 0"/>
+    </joint>
 
-      <material name="black">
-        <color rgba="0.05 0.05 0.05 1"/>
-      </material>
-    </visual>
+  </xacro:if>
+
+  <xacro:if value="${drive_mode == 'ackermann'}">
+
+    <joint name="front_left_steering_joint" type="revolute">
+      <parent link="base_link"/>
+      <child  link="front_left_knuckle_link"/>
+      <origin xyz="${wheelbase} ${track_width/2} 0" rpy="0 0 0"/>
+      <axis xyz="0 0 1"/>
+      <limit lower="${-max_steer}" upper="${max_steer}"
+             effort="10.0" velocity="5.0"/>
+      <dynamics damping="0.1" friction="0.05"/>
+    </joint>
+
+    <joint name="front_right_steering_joint" type="revolute">
+      <parent link="base_link"/>
+      <child  link="front_right_knuckle_link"/>
+      <origin xyz="${wheelbase} ${-track_width/2} 0" rpy="0 0 0"/>
+      <axis xyz="0 0 1"/>
+      <limit lower="${-max_steer}" upper="${max_steer}"
+             effort="10.0" velocity="5.0"/>
+      <dynamics damping="0.1" friction="0.05"/>
+    </joint>
+
+    <link name="steering_wheel_link">
+      <xacro:box_inertia m="0.01" x="0.01" y="0.01" z="0.01"/>
+    </link>
+
+    <joint name="steering_wheel_joint" type="revolute">
+      <parent link="base_link"/>
+      <child  link="steering_wheel_link"/>
+      <origin xyz="${chassis_x} 0 ${chassis_top}" rpy="0 0 0"/>
+      <axis xyz="0 0 1"/>
+      <limit lower="-7.85" upper="7.85" effort="1.0" velocity="10.0"/>
+    </joint>
+
+  </xacro:if>
 
 
-    <collision>
-      <origin
-        xyz="0 0 0"
-        rpy="1.5708 0 0"/>
-
-      <geometry>
-        <cylinder
-          radius="0.03"
-          length="0.02"/>
-      </geometry>
-    </collision>
-
-
-    <inertial>
-      <origin xyz="0 0 0" rpy="0 0 0"/>
-
-      <mass value="0.15"/>
-
-      <inertia
-        ixx="0.0001"
-        ixy="0.0"
-        ixz="0.0"
-        iyy="0.0001"
-        iyz="0.0"
-        izz="0.0001"/>
-    </inertial>
-
-  </link>
-
-
-  <joint
-    name="rear_left_wheel_joint"
-    type="continuous">
-
-    <parent link="base_link"/>
-    <child link="rear_left_wheel_link"/>
-
-    <origin
-      xyz="-0.09 0.085 -0.02"
-      rpy="0 0 0"/>
-
+  <joint name="front_left_wheel_joint" type="continuous">
+    <parent link="front_left_knuckle_link"/>
+    <child  link="front_left_wheel_link"/>
+    <origin xyz="0 0 0" rpy="0 0 0"/>
     <axis xyz="0 1 0"/>
-
-    <dynamics
-      damping="0.1"
-      friction="0.1"/>
-
+    <dynamics damping="0.02" friction="0.0"/>
   </joint>
 
-
-  <!-- ===================================================== -->
-  <!-- REAR RIGHT WHEEL                                      -->
-  <!-- ===================================================== -->
-
-  <link name="rear_right_wheel_link">
-
-    <visual>
-      <origin
-        xyz="0 0 0"
-        rpy="1.5708 0 0"/>
-
-      <geometry>
-        <cylinder
-          radius="0.03"
-          length="0.02"/>
-      </geometry>
-
-      <material name="black">
-        <color rgba="0.05 0.05 0.05 1"/>
-      </material>
-    </visual>
-
-
-    <collision>
-      <origin
-        xyz="0 0 0"
-        rpy="1.5708 0 0"/>
-
-      <geometry>
-        <cylinder
-          radius="0.03"
-          length="0.02"/>
-      </geometry>
-    </collision>
-
-
-    <inertial>
-      <origin xyz="0 0 0" rpy="0 0 0"/>
-
-      <mass value="0.15"/>
-
-      <inertia
-        ixx="0.0001"
-        ixy="0.0"
-        ixz="0.0"
-        iyy="0.0001"
-        iyz="0.0"
-        izz="0.0001"/>
-    </inertial>
-
-  </link>
-
-
-  <joint
-    name="rear_right_wheel_joint"
-    type="continuous">
-
-    <parent link="base_link"/>
-    <child link="rear_right_wheel_link"/>
-
-    <origin
-      xyz="-0.09 -0.085 -0.02"
-      rpy="0 0 0"/>
-
+  <joint name="front_right_wheel_joint" type="continuous">
+    <parent link="front_right_knuckle_link"/>
+    <child  link="front_right_wheel_link"/>
+    <origin xyz="0 0 0" rpy="0 0 0"/>
     <axis xyz="0 1 0"/>
-
-    <dynamics
-      damping="0.0"
-      friction="0.0"/>
-
+    <dynamics damping="0.02" friction="0.0"/>
   </joint>
 
 
-  <!-- ===================================================== -->
-  <!-- LIDAR LINK                                             -->
-  <!-- ===================================================== -->
+  <!-- =====================================================
+       LIDAR - directly over the rear axle, i.e. over the
+       pivot centre and over the odometry origin.
+       ===================================================== -->
 
   <link name="lidar_link">
 
     <visual>
-      <origin
-        xyz="0 0 0"
-        rpy="0 0 0"/>
-
+      <origin xyz="0 0 0" rpy="0 0 0"/>
       <geometry>
-        <cylinder
-          radius="0.04"
-          length="0.03"/>
+        <cylinder radius="${lidar_radius}" length="${lidar_height}"/>
       </geometry>
-
       <material name="lidar_black">
         <color rgba="0 0 0 1"/>
       </material>
     </visual>
 
-
     <inertial>
-      <origin
-        xyz="0 0 0"
-        rpy="0 0 0"/>
-
-      <mass value="0.05"/>
-
-      <inertia
-        ixx="0.0001"
-        ixy="0.0"
-        ixz="0.0"
-        iyy="0.0001"
-        iyz="0.0"
-        izz="0.0001"/>
+      <origin xyz="0 0 0" rpy="0 0 0"/>
+      <mass value="${lidar_mass}"/>
+      <inertia ixx="0.0001" ixy="0.0" ixz="0.0"
+               iyy="0.0001" iyz="0.0" izz="0.0001"/>
     </inertial>
 
   </link>
 
-
   <joint name="lidar_joint" type="fixed">
-
     <parent link="base_link"/>
-    <child link="lidar_link"/>
-
-    <origin
-      xyz="0 0 0.05"
-      rpy="0 0 0"/>
-
+    <child  link="lidar_link"/>
+    <origin xyz="0 0 ${lidar_z}" rpy="0 0 0"/>
   </joint>
 
 
-  <!-- ===================================================== -->
-  <!-- LIDAR GAZEBO SENSOR                                   -->
-  <!-- ===================================================== -->
+  <!-- =====================================================
+       LIDAR SENSOR
+       A1M8: 360 deg, 0.15 - 6.0 m, ~5.5 Hz, <= 1 deg.
+       360 samples keeps index == degrees.
+       ===================================================== -->
 
   <gazebo reference="lidar_link">
 
-    <sensor
-      name="lidar_sensor"
-      type="ray">
+    <material>Gazebo/Black</material>
 
-      <pose>
-        0 0 0 0 0 0
-      </pose>
+    <sensor name="lidar_sensor" type="ray">
 
-      <!-- Prevent Gazebo Classic Ogre ray-visualization crash -->
-      <visualize>false</visualize>
-
-      <update_rate>10</update_rate>
-
+      <pose>0 0 0 0 0 0</pose>
+      <visualize>true</visualize>
+      <update_rate>5.5</update_rate>
       <always_on>true</always_on>
 
       <ray>
-
         <scan>
-
           <horizontal>
-
             <samples>360</samples>
-
             <resolution>1</resolution>
-
-            <!-- Avoid exactly coincident -pi/+pi rays -->
-            <min_angle>-3.13</min_angle>
-            <max_angle>3.13</max_angle>
-
+            <min_angle>-3.14159</min_angle>
+            <max_angle>3.14159</max_angle>
           </horizontal>
-
         </scan>
 
-
         <range>
-
-          <min>0.12</min>
-          <max>10.0</max>
+          <min>0.15</min>
+          <max>6.0</max>
           <resolution>0.01</resolution>
-
         </range>
 
+        <noise>
+          <type>gaussian</type>
+          <mean>0.0</mean>
+          <stddev>${lidar_noise_stddev}</stddev>
+        </noise>
       </ray>
 
-
-      <plugin
-        name="gazebo_ros_lidar"
-        filename="libgazebo_ros_ray_sensor.so">
-
+      <plugin name="gazebo_ros_lidar"
+              filename="libgazebo_ros_ray_sensor.so">
         <ros>
           <namespace>/</namespace>
           <remapping>~/out:=scan</remapping>
         </ros>
-
-        <output_type>
-          sensor_msgs/LaserScan
-        </output_type>
-
-        <frame_name>
-          lidar_link
-        </frame_name>
-
+        <output_type>sensor_msgs/LaserScan</output_type>
+        <frame_name>lidar_link</frame_name>
       </plugin>
 
     </sensor>
@@ -679,207 +421,172 @@
   </gazebo>
 
 
-  <!-- ===================================================== -->
-  <!-- GAZEBO MATERIALS / FRICTION                           -->
-  <!-- ===================================================== -->
+  <!-- =====================================================
+       SURFACE PROPERTIES
+       ===================================================== -->
 
   <gazebo reference="base_link">
-    <material>
-      Gazebo/Blue
-    </material>
+    <material>Gazebo/Blue</material>
   </gazebo>
 
+  <xacro:macro name="wheel_surface" params="name mu">
+    <gazebo reference="${name}_link">
+      <material>Gazebo/Black</material>
+      <mu1>${mu}</mu1>
+      <mu2>${mu}</mu2>
+      <kp>1000000.0</kp>
+      <kd>1.0</kd>
+      <minDepth>0.001</minDepth>
+      <maxVel>0.1</maxVel>
+    </gazebo>
+  </xacro:macro>
+
+  <!-- diff mode: the front wheels replace the old caster. Near-zero
+       friction means they contribute almost no yaw resistance, so
+       the pivot centre lands on the rear axle where the LIDAR and
+       the odometry origin are.
+
+       Do NOT give these grip in diff mode. With gripping front
+       wheels this becomes a skid-steer whose driving moment arm
+       (track/2 = 0.1110 m) barely exceeds its resisting arm
+       (wheelbase/2 = 0.1065 m). A ratio of 1.04 is inside the
+       noise of ODE's friction-direction handling, and the robot
+       simply will not rotate. That is what caused
+       "TURN TIMEOUT ... remaining error=1.571 rad".
+
+       mu1 and mu2 are also deliberately kept equal everywhere:
+       without an explicit <fdir1> ODE picks the first friction
+       direction arbitrarily, so anisotropic values are a coin
+       flip as to which one acts along the rolling direction. -->
+  <xacro:if value="${drive_mode == 'diff'}">
+    <xacro:wheel_surface name="rear_left_wheel"   mu="1.0"/>
+    <xacro:wheel_surface name="rear_right_wheel"  mu="1.0"/>
+    <xacro:wheel_surface name="front_left_wheel"  mu="0.02"/>
+    <xacro:wheel_surface name="front_right_wheel" mu="0.02"/>
+  </xacro:if>
+
+  <!-- True Ackermann needs lateral grip on all four or it
+       understeers straight through every corner. -->
+  <xacro:if value="${drive_mode == 'ackermann'}">
+    <xacro:wheel_surface name="rear_left_wheel"   mu="1.0"/>
+    <xacro:wheel_surface name="rear_right_wheel"  mu="1.0"/>
+    <xacro:wheel_surface name="front_left_wheel"  mu="1.0"/>
+    <xacro:wheel_surface name="front_right_wheel" mu="1.0"/>
+    <gazebo reference="front_left_knuckle_link">
+      <material>Gazebo/Grey</material>
+    </gazebo>
+    <gazebo reference="front_right_knuckle_link">
+      <material>Gazebo/Grey</material>
+    </gazebo>
+  </xacro:if>
+
+
+  <!-- =====================================================
+       DRIVE PLUGIN - DIFFERENTIAL (rear axle only)
+       cmd_vel semantics unchanged, so grid_rl_controller.py
+       and run_policy.py work as they are.
+       ===================================================== -->
+
+  <xacro:if value="${drive_mode == 'diff'}">
+
+    <gazebo>
+
+      <plugin name="diff_drive"
+              filename="libgazebo_ros_diff_drive.so">
+
+        <ros>
+          <namespace>/</namespace>
+        </ros>
+
+        <left_joint>rear_left_wheel_joint</left_joint>
+        <right_joint>rear_right_wheel_joint</right_joint>
+
+        <wheel_separation>${track_width}</wheel_separation>
+        <wheel_diameter>${2*wheel_radius}</wheel_diameter>
+
+        <!-- 3.0 rad/s^2 on 0.0505 m tyres is only 0.15 m/s^2, so
+             the robot coasted 0.074 m past every cell centre. Add
+             the 0.08 m position tolerance and it stopped up to
+             0.154 m off, which put a wall on the far side at
+             0.604 m - past the 0.55 m detection threshold, and so
+             reported OPEN when it was solid.
+
+             20.0 rad/s^2 = 1.01 m/s^2 -> 0.011 m of coast. -->
+        <max_wheel_torque>4.0</max_wheel_torque>
+        <max_wheel_acceleration>20.0</max_wheel_acceleration>
+
+        <command_topic>cmd_vel</command_topic>
+        <odometry_topic>odom</odometry_topic>
+        <odometry_frame>odom</odometry_frame>
+        <robot_base_frame>base_footprint</robot_base_frame>
+
+        <publish_odom>true</publish_odom>
+        <publish_odom_tf>true</publish_odom_tf>
+        <publish_wheel_tf>true</publish_wheel_tf>
+
+      </plugin>
+
+    </gazebo>
+
+  </xacro:if>
+
 
-  <gazebo reference="front_left_wheel_link">
+  <!-- =====================================================
+       DRIVE PLUGIN - TRUE ACKERMANN
 
-    <material>
-      Gazebo/Black
-    </material>
+       WARNING: steering angle comes from
+       atan(L * angular.z / linear.x). cmd_vel with
+       linear.x == 0 produces NO motion, so every in-place
+       pivot stalls until the turn primitive is replaced.
+       ===================================================== -->
 
-    <mu1>1.0</mu1>
-    <mu2>1.0</mu2>
+  <xacro:if value="${drive_mode == 'ackermann'}">
 
-    <kp>1000000.0</kp>
-    <kd>1.0</kd>
+    <gazebo>
 
-  </gazebo>
+      <plugin name="ackermann_drive"
+              filename="libgazebo_ros_ackermann_drive.so">
 
+        <ros>
+          <namespace>/</namespace>
+        </ros>
 
-  <gazebo reference="front_right_wheel_link">
+        <update_rate>100.0</update_rate>
 
-    <material>
-      Gazebo/Black
-    </material>
+        <front_left_joint>front_left_wheel_joint</front_left_joint>
+        <front_right_joint>front_right_wheel_joint</front_right_joint>
+        <rear_left_joint>rear_left_wheel_joint</rear_left_joint>
+        <rear_right_joint>rear_right_wheel_joint</rear_right_joint>
 
-    <mu1>1.0</mu1>
-    <mu2>1.0</mu2>
+        <left_steering_joint>front_left_steering_joint</left_steering_joint>
+        <right_steering_joint>front_right_steering_joint</right_steering_joint>
+        <steering_wheel_joint>steering_wheel_joint</steering_wheel_joint>
 
-    <kp>1000000.0</kp>
-    <kd>1.0</kd>
+        <max_steer>${max_steer}</max_steer>
+        <max_steering_angle>7.85</max_steering_angle>
+        <max_speed>1.0</max_speed>
 
-  </gazebo>
+        <left_steering_pid_gain>10.0 0.0 0.5</left_steering_pid_gain>
+        <left_steering_i_range>0 0</left_steering_i_range>
 
+        <right_steering_pid_gain>10.0 0.0 0.5</right_steering_pid_gain>
+        <right_steering_i_range>0 0</right_steering_i_range>
 
-  <gazebo reference="rear_left_wheel_link">
+        <linear_velocity_pid_gain>20.0 0.0 1.0</linear_velocity_pid_gain>
+        <linear_velocity_i_range>0 0</linear_velocity_i_range>
 
-    <material>
-      Gazebo/Black
-    </material>
+        <publish_odom>true</publish_odom>
+        <publish_odom_tf>true</publish_odom_tf>
+        <publish_wheel_tf>true</publish_wheel_tf>
+        <publish_distance>true</publish_distance>
 
-    <mu1>1.0</mu1>
-    <mu2>1.0</mu2>
+        <odometry_frame>odom</odometry_frame>
+        <robot_base_frame>base_footprint</robot_base_frame>
 
-    <kp>1000000.0</kp>
-    <kd>1.0</kd>
+      </plugin>
 
-  </gazebo>
+    </gazebo>
 
-
-  <gazebo reference="rear_right_wheel_link">
-
-    <material>
-      Gazebo/Black
-    </material>
-
-    <mu1>1.0</mu1>
-    <mu2>1.0</mu2>
-
-    <kp>1000000.0</kp>
-    <kd>1.0</kd>
-
-  </gazebo>
-
-
-  <!-- ===================================================== -->
-  <!-- ACKERMANN DRIVE PLUGIN                                -->
-  <!-- ===================================================== -->
-
-  <gazebo>
-
-    <plugin
-      name="ackermann_drive"
-      filename="libgazebo_ros_ackermann_drive.so">
-
-      <ros>
-        <namespace>/</namespace>
-      </ros>
-
-      <update_rate>
-        50.0
-      </update_rate>
-
-
-      <front_left_joint>
-        front_left_wheel_joint
-      </front_left_joint>
-
-      <front_right_joint>
-        front_right_wheel_joint
-      </front_right_joint>
-
-      <rear_left_joint>
-        rear_left_wheel_joint
-      </rear_left_joint>
-
-      <rear_right_joint>
-        rear_right_wheel_joint
-      </rear_right_joint>
-
-
-      <left_steering_joint>
-        front_left_steering_joint
-      </left_steering_joint>
-
-      <right_steering_joint>
-        front_right_steering_joint
-      </right_steering_joint>
-
-
-      <steering_wheel_joint>
-        steering_joint
-      </steering_wheel_joint>
-
-
-      <wheel_separation>
-        0.17
-      </wheel_separation>
-
-      <wheel_diameter>
-        0.06
-      </wheel_diameter>
-
-      <wheel_base>
-        0.18
-      </wheel_base>
-
-
-      <max_steer>
-        0.6
-      </max_steer>
-
-      <max_steering_angle>
-        7.85
-      </max_steering_angle>
-
-      <max_speed>
-        2.0
-      </max_speed>
-
-
-      <left_steering_pid_gain>
-        1500 0 1
-      </left_steering_pid_gain>
-
-      <left_steering_i_range>
-        0 0
-      </left_steering_i_range>
-
-
-      <right_steering_pid_gain>
-        1500 0 1
-      </right_steering_pid_gain>
-
-      <right_steering_i_range>
-        0 0
-      </right_steering_i_range>
-
-
-      <linear_velocity_pid_gain>
-        1000 0 1
-      </linear_velocity_pid_gain>
-
-      <linear_velocity_i_range>
-        0 0
-      </linear_velocity_i_range>
-
-
-      <odometry_topic>
-        odom
-      </odometry_topic>
-
-      <odometry_frame>
-        odom
-      </odometry_frame>
-
-      <robot_base_frame>
-        base_footprint
-      </robot_base_frame>
-
-
-      <publish_odom>
-        true
-      </publish_odom>
-
-      <publish_odom_tf>
-        true
-      </publish_odom_tf>
-
-      <publish_wheel_tf>
-        true
-      </publish_wheel_tf>
-
-    </plugin>
-
-  </gazebo>
+  </xacro:if>
 
 </robot>

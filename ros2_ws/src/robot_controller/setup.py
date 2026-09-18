@@ -6,12 +6,18 @@ setup(
     name=package_name,
     version='0.0.0',
     packages=find_packages(exclude=['test']),
+    # q_table.pkl is deliberately NOT packaged. It used to be listed in
+    # both package_data and data_files, so every colcon build made two
+    # more copies of it; train.py then saved next to whichever copy got
+    # imported while run_policy.py searched a different order, and the
+    # two drifted apart. The table now lives at a single path outside
+    # the workspace - see robot_controller/q_table_path.py ($RL_Q_TABLE,
+    # falling back to ~/.ros/rl_ackermann/q_table.pkl).
     data_files=[
     ('share/ament_index/resource_index/packages',
         ['resource/' + package_name]),
     ('share/' + package_name, [
         'package.xml',
-        'robot_controller/q_table.pkl',
     ]),
 ],
     install_requires=['setuptools'],

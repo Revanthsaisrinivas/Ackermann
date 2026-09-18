@@ -1,543 +1,595 @@
 #!/usr/bin/env python3
-"""
-RL training environment for the 5x5 maze defined in maze.world.
-
-WALL DATA SOURCE OF TRUTH
----------------------------
-BLOCKED_EDGES below is derived DIRECTLY from the wall <pose>/<size>
-values in maze.world. Each entry is an explicit, unambiguous pair of
-adjacent cells that a wall sits between -- commented with exactly
-which named wall model in maze.world it comes from, so there's no
-row/col ordering convention to get backwards (that ambiguity is what
-caused a real, confirmed-by-testing bug in an earlier version of this
-file's wall tables -- this representation removes that failure mode
-entirely rather than just fixing one instance of it).
-
-If you ever edit a wall in maze.world, add/update the matching entry
-here.
-
-TWO SEPARATE SOURCES OF TRUTH
-------------------------------
-This file deliberately keeps two things that must never be mixed:
-
-  * self.blocked_edges (ground truth) -- the real walls, used ONLY by
-    is_valid_move() to decide what actually happens when the robot
-    tries to move, and by scan_current_cell() to simulate what the
-    robot's sensors would detect. Nothing the RL agent reads directly
-    touches this.
-
-  * self.discovered_walls (agent's knowledge) -- what the robot has
-    actually sensed so far. It starts empty every episode and is
-    written to in exactly one place: scan_current_cell(). This is the
-    only thing get_state() / get_valid_actions() are allowed to read.
-
-step() is the boundary between the two: it asks "is this action even
-choosable given what's been discovered?" (informational, via
-get_valid_actions()) and, separately, "did the robot actually hit a
-wall?" (decided purely from ground truth). The agent is never handed
-wall information about a cell it hasn't yet stood in and scanned.
-"""
 
 import random
-from collections import defaultdict
+from collections import deque
 
 
 class MazeEnvironment:
 
-    # =====================================================
-    # Directions (absolute, arranged counter-clockwise:
-    # EAST -> NORTH -> WEST -> SOUTH -> EAST)
-    # =====================================================
+    GRID_SIZE = 5
+
+    # Action priority:
+    # EAST -> NORTH -> WEST -> SOUTH
+    ACTIONS = [0, 1, 2, 3]
 
     EAST = 0
     NORTH = 1
     WEST = 2
     SOUTH = 3
 
-    ACTIONS = [EAST, NORTH, WEST, SOUTH]
-
-    DELTA = {
-        EAST:  (1, 0),
+    DIRECTIONS = {
+        EAST: (1, 0),
         NORTH: (0, 1),
-        WEST:  (-1, 0),
-        SOUTH: (0, -1)
+        WEST: (-1, 0),
+        SOUTH: (0, -1),
     }
 
-    GRID_SIZE = 5
+    ACTION_PRIORITY = [EAST, NORTH, WEST, SOUTH]
 
-    # =====================================================
-    # Maze wall layout -- one frozenset pair per wall segment
-    # in maze.world. Order within each pair doesn't matter
-    # (frozenset), which is exactly what removes the row/col
-    # ordering ambiguity that caused the earlier bug.
-    # =====================================================
-
-    BLOCKED_EDGES = {
-        frozenset({(2, 4), (3, 4)}),  # wall_D1_D2  (X=3.0, row 4)
-        frozenset({(3, 4), (4, 4)}),  # wall_E1_E2  (X=4.0, row 4)
-        frozenset({(2, 3), (2, 4)}),  # wall_C2_D2  (Y=4.0, col 2)
-        frozenset({(1, 2), (1, 3)}),  # wall_B3_D3  (Y=3.0, col 1)
-        frozenset({(2, 2), (2, 3)}),  # wall_B3_D3  (Y=3.0, col 2)
-        frozenset({(2, 2), (3, 2)}),  # wall_D3_D4  (X=3.0, row 2)
-        frozenset({(3, 1), (4, 1)}),  # wall_E3_E5  (X=4.0, row 1)
-        frozenset({(3, 2), (4, 2)}),  # wall_E3_E5  (X=4.0, row 2)
-        frozenset({(2, 1), (2, 2)}),  # wall_C4_D4  (Y=2.0, col 2)
-        frozenset({(0, 0), (0, 1)}),  # wall_A5_C5  (Y=1.0, col 0)
-        frozenset({(1, 0), (1, 1)}),  # wall_A5_C5  (Y=1.0, col 1)
-        frozenset({(3, 0), (3, 1)}),  # wall_D5_E5  (Y=1.0, col 3)
-    }
-
-    # =====================================================
-    # Reward shaping constants -- kept as named constants so
-    # they're easy to tune later without hunting through step().
-    # =====================================================
-
+    INVALID_MOVE_PENALTY = -10
     STEP_PENALTY = -1
-    REVISIT_PENALTY = 0
-    INVALID_MOVE_PENALTY = -20
     GOAL_REWARD = 100
-    TIMEOUT_PENALTY = -50
+    TIMEOUT_PENALTY = -20
+
+    # Raised from -2. A revisit penalty this close to the plain
+    # STEP_PENALTY (-1) barely discourages backtracking - in states
+    # that are rarely visited during domain-randomized training,
+    # Q-values for a backward move and a forward move can end up
+    # within noise distance of each other (this is what produced the
+    # WEST=30.2 vs NORTH=29.7 near-tie at one state in testing, even
+    # though the actually-selected action, EAST, was still correct).
+    # A stronger gap gives cleaner separation.
+    REVISIT_PENALTY = -5
+
+    # Potential-based reward shaping: add a small bonus/penalty each
+    # step proportional to how much closer/farther the move made the
+    # robot from the goal (Manhattan distance). This does not change
+    # what the optimal policy is (it's a zero-sum telescoping term),
+    # it just gives the agent a much clearer, denser signal that
+    # moving toward the goal is good and moving away is bad, on every
+    # single step rather than only at terminal states - which speeds
+    # up convergence and reduces exactly the kind of close Q-value
+    # ties described above. Set to 0.0 to disable.
+    DISTANCE_SHAPING_WEIGHT = 0.5
 
     def __init__(self):
 
-        # Instance-level copy of the class wall table -- kept as a
-        # separate attribute (rather than reading the class constant
-        # directly everywhere) so a future variant of this environment
-        # could load a *different* maze at runtime by overwriting this
-        # set after construction.
-        self.blocked_edges = set(self.BLOCKED_EDGES)
+        # ----------------------------------------------------
+        # HIDDEN MAZE
+        #
+        # The agent does NOT directly receive blocked_edges.
+        # It only receives sensor wall observations.
+        #
+        # This default layout is only used if you construct
+        # MazeEnvironment() and never call randomize_maze() /
+        # reset(randomize_maze=True). For TRAINING that is meant
+        # to generalize to an unknown physical maze, you should
+        # randomize the maze every episode (see train.py), so the
+        # agent never gets to memorize one specific layout.
+        # ----------------------------------------------------
 
-        # Robot's discovered map -- the ONLY thing the RL-facing API
-        # is allowed to read from. Populated exclusively by
-        # scan_current_cell(). Must start empty every episode.
-        self.discovered_walls = {}
+        self.blocked_edges = {
+
+            frozenset({(2, 4), (3, 4)}),
+            frozenset({(3, 4), (4, 4)}),
+
+            frozenset({(2, 3), (2, 4)}),
+
+            frozenset({(1, 2), (1, 3)}),
+
+            frozenset({(2, 2), (2, 3)}),
+            frozenset({(2, 2), (3, 2)}),
+
+            frozenset({(3, 1), (4, 1)}),
+            frozenset({(3, 2), (4, 2)}),
+
+            frozenset({(2, 1), (2, 2)}),
+
+            frozenset({(0, 0), (0, 1)}),
+
+            frozenset({(1, 0), (1, 1)}),
+
+            frozenset({(3, 0), (3, 1)}),
+        }
 
         self.robot = (0, 0)
         self.goal = (4, 4)
+
         self.heading = self.EAST
+
+        self.discovered_walls = {}
 
         self.visited = set()
 
         self.max_steps = 100
-        self.current_steps = 0
+        self.steps = 0
 
-    ##########################################################
+    # ============================================================
     # RESET
-    ##########################################################
+    # ============================================================
 
-    def reset(self, start=None, goal=None, heading=None):
-        self.discovered_walls = {}
+    def reset(
+        self,
+        start=(0, 0),
+        goal=(4, 4),
+        heading=EAST,
+        randomize_maze=False,
+        block_probability=0.35,
+    ):
 
-        if start is None:
-            start = (
-                random.randint(0, self.GRID_SIZE - 1),
-                random.randint(0, self.GRID_SIZE - 1)
-            )
-
-        if goal is None:
-            goal = (
-                random.randint(0, self.GRID_SIZE - 1),
-                random.randint(0, self.GRID_SIZE - 1)
-            )
-
-        while goal == start:
-            goal = (
-                random.randint(0, self.GRID_SIZE - 1),
-                random.randint(0, self.GRID_SIZE - 1)
+        if randomize_maze:
+            self.blocked_edges = self.generate_random_maze(
+                block_probability=block_probability
             )
 
         self.robot = start
         self.goal = goal
-        self.heading = heading if heading is not None else self.EAST
-        self.visited = {start}
-        self.current_steps = 0
+        self.heading = heading
 
-        # Robot "powers on" in place and its sensors read the walls
-        # of the cell it's standing in -- same mechanism as any other
-        # scan, just triggered at episode start instead of mid-step.
+        self.discovered_walls = {}
+
+        self.visited = {self.robot}
+
+        self.steps = 0
+
+        # Initial sensor scan
         self.scan_current_cell()
 
         return self.get_state()
 
-    ##########################################################
-    # STATE
-    ##########################################################
+    # ============================================================
+    # RANDOM MAZE GENERATION (DOMAIN RANDOMIZATION)
+    #
+    # Generates a random set of blocked edges such that the
+    # resulting maze is fully connected (every cell reachable
+    # from every other cell), so any start/goal pair is solvable.
+    #
+    # Training against a new random maze every episode is what
+    # forces the agent to learn a policy that reacts to LIDAR
+    # wall readings + relative goal direction, instead of
+    # memorizing one specific hidden layout.
+    # ============================================================
 
-    def _relative_action(self, offset):
-        """Absolute direction `offset` quarter-turns CCW from heading."""
-        return (self.heading + offset) % len(self.ACTIONS)
+    def all_edges(self):
 
-    def _front_action(self):
-        return self._relative_action(0)
+        edges = set()
 
-    def _left_action(self):
-        return self._relative_action(1)
+        for x in range(self.GRID_SIZE):
+            for y in range(self.GRID_SIZE):
 
-    def _right_action(self):
-        return self._relative_action(-1)
+                if x + 1 < self.GRID_SIZE:
+                    edges.add(frozenset({(x, y), (x + 1, y)}))
 
-    def _back_action(self):
-        return self._relative_action(2)
+                if y + 1 < self.GRID_SIZE:
+                    edges.add(frozenset({(x, y), (x, y + 1)}))
 
-    def get_state(self):
-        """
-        State is (robot_x, robot_y, goal_x, goal_y, heading,
-        front_wall, left_wall, right_wall, back_wall).
+        return edges
 
-        The four wall bits come ONLY from discovered_walls (never
-        from blocked_edges directly) and are relative to the robot's
-        current heading, matching the directional controller's
-        front/left/right/back sensor layout. If the current cell
-        hasn't been scanned yet (shouldn't normally happen, since
-        reset()/step() always scan on arrival) unexplored directions
-        default to 0 (open), consistent with
-        get_discovered_valid_actions()'s "unexplored == available"
-        convention.
-        """
+    def is_fully_connected(self, blocked_edges):
 
-        walls = self.discovered_walls.get(self.robot, {})
+        open_edges = self.all_edges() - blocked_edges
 
-        front_wall = int(walls.get(self._front_action(), False))
-        left_wall = int(walls.get(self._left_action(), False))
-        right_wall = int(walls.get(self._right_action(), False))
-        back_wall = int(walls.get(self._back_action(), False))
+        adjacency = {}
+
+        for edge in open_edges:
+
+            a, b = tuple(edge)
+
+            adjacency.setdefault(a, []).append(b)
+            adjacency.setdefault(b, []).append(a)
+
+        start = (0, 0)
+
+        visited = {start}
+
+        queue = deque([start])
+
+        while queue:
+
+            cell = queue.popleft()
+
+            for neighbor in adjacency.get(cell, []):
+
+                if neighbor not in visited:
+
+                    visited.add(neighbor)
+
+                    queue.append(neighbor)
+
+        total_cells = self.GRID_SIZE * self.GRID_SIZE
+
+        return len(visited) == total_cells
+
+    def generate_random_maze(
+        self,
+        block_probability=0.35,
+        max_attempts=500,
+    ):
+
+        edges = list(self.all_edges())
+
+        for _ in range(max_attempts):
+
+            candidate = {
+                edge for edge in edges
+                if random.random() < block_probability
+            }
+
+            if self.is_fully_connected(candidate):
+
+                return candidate
+
+        # Fallback: fully open maze (always solvable) if we
+        # somehow failed to sample a connected layout.
+        return set()
+
+    # ============================================================
+    # GRID CHECK
+    # ============================================================
+
+    # ============================================================
+    # MANHATTAN DISTANCE
+    #
+    # Used only for reward shaping in step(). Not part of the
+    # agent-visible state.
+    # ============================================================
+
+    def manhattan_distance(self, a, b):
+
+        return abs(a[0] - b[0]) + abs(a[1] - b[1])
+
+    def is_inside_grid(self, position):
+
+        x, y = position
 
         return (
-            self.robot[0],
-            self.robot[1],
-            self.goal[0],
-            self.goal[1],
-            self.heading,
-            front_wall,
-            left_wall,
-            right_wall,
-            back_wall
+            0 <= x < self.GRID_SIZE
+            and
+            0 <= y < self.GRID_SIZE
         )
 
-    ##########################################################
-    # CHECK WALL (ground truth -- never read by the RL agent
-    # directly; only used internally by step()/scan_current_cell())
-    ##########################################################
+    # ============================================================
+    # HIDDEN TRUE WALL
+    #
+    # Used internally by the simulator.
+    # Agent never receives blocked_edges directly.
+    # ============================================================
 
-    def is_valid_move(self, action):
+    def is_true_wall(
+        self,
+        position,
+        action
+    ):
 
-        x, y = self.robot
+        dx, dy = self.DIRECTIONS[action]
 
-        dx, dy = self.DELTA[action]
+        next_position = (
+            position[0] + dx,
+            position[1] + dy,
+        )
 
-        nx = x + dx
-        ny = y + dy
+        # Grid boundary
+        if not self.is_inside_grid(next_position):
+            return True
 
-        # Outside maze
-        if nx < 0 or nx >= self.GRID_SIZE:
-            return False
+        edge = frozenset({
+            position,
+            next_position
+        })
 
-        if ny < 0 or ny >= self.GRID_SIZE:
-            return False
+        return edge in self.blocked_edges
 
-        # Internal walls -- a single, unambiguous lookup: is there a
-        # wall on the edge between the current cell and the cell
-        # we're trying to move into? frozenset means the pair order
-        # never matters, which is exactly what removes the row/col
-        # ordering bug that existed in the previous tuple-based
-        # version of this check.
-        edge = frozenset({(x, y), (nx, ny)})
-
-        if edge in self.blocked_edges:
-            return False
-
-        return True
+    # ============================================================
+    # SENSOR SCAN
+    # ============================================================
 
     def scan_current_cell(self):
-        """
-        Simulate the robot's laser scanner.
-
-        Returns the wall configuration of the current cell and stores
-        it in the discovered map. This is the ONLY place
-        discovered_walls is ever written -- every bit of wall
-        knowledge the RL side ever gets has to come through here.
-        Idempotent: a cell already in discovered_walls is returned
-        from cache rather than re-derived.
-        """
-
-        if self.robot in self.discovered_walls:
-            return self.discovered_walls[self.robot]
 
         walls = {}
 
         for action in self.ACTIONS:
-            walls[action] = not self.is_valid_move(action)
 
-        self.discovered_walls[self.robot] = walls
+            walls[action] = self.is_true_wall(
+                self.robot,
+                action
+            )
+
+        self.discovered_walls[
+            self.robot
+        ] = walls
 
         return walls
 
-    def get_discovered_valid_actions(self):
-        """
-        Return actions using ONLY the robot's discovered map.
+    # ============================================================
+    # CURRENT SENSOR WALLS
+    # ============================================================
 
-        Unknown directions are treated as unexplored and therefore
-        allowed. Once a cell has been scanned, its wall information
-        is remembered forever.
-        """
+    def get_current_walls(self):
 
-        actions = []
+        if self.robot not in self.discovered_walls:
+
+            self.scan_current_cell()
+
+        walls = self.discovered_walls[
+            self.robot
+        ].copy()
 
         x, y = self.robot
 
-        # If this cell has never been scanned,
-        # every in-bounds direction is considered possible.
-        if self.robot not in self.discovered_walls:
+        if x <= 0:
+            walls[self.WEST] = True
+        if x >= self.GRID_SIZE - 1:
+            walls[self.EAST] = True
+        if y <= 0:
+            walls[self.SOUTH] = True
+        if y >= self.GRID_SIZE - 1:
+            walls[self.NORTH] = True
 
-            for action in self.ACTIONS:
+        return walls
 
-                dx, dy = self.DELTA[action]
+    def is_valid_grid_move(self, position, action):
 
-                nx = x + dx
-                ny = y + dy
+        x, y = position
+        dx, dy = self.DIRECTIONS[action]
+        new_x = x + dx
+        new_y = y + dy
 
-                if (
-                    0 <= nx < self.GRID_SIZE and
-                    0 <= ny < self.GRID_SIZE
-                ):
-                    actions.append(action)
+        if not (0 <= new_x < self.GRID_SIZE):
+            return False
 
-            return actions
+        if not (0 <= new_y < self.GRID_SIZE):
+            return False
 
-        walls = self.discovered_walls[self.robot]
+        return True
 
-        for action in self.ACTIONS:
+    # ============================================================
+    # VALID ACTIONS
+    #
+    # Returned in priority order:
+    # EAST -> NORTH -> WEST -> SOUTH
+    # ============================================================
+
+    def get_valid_actions(self):
+
+        walls = self.get_current_walls()
+
+        valid_actions = []
+
+        for action in self.ACTION_PRIORITY:
 
             if walls[action]:
                 continue
 
-            dx, dy = self.DELTA[action]
+            if not self.is_valid_grid_move(self.robot, action):
+                continue
 
-            nx = x + dx
-            ny = y + dy
+            valid_actions.append(action)
 
-            if (
-                0 <= nx < self.GRID_SIZE and
-                0 <= ny < self.GRID_SIZE
-            ):
-                actions.append(action)
+        return valid_actions
 
-        return actions
+    # ============================================================
+    # RELATIVE 7-VALUE STATE
+    #
+    # (
+    #     dx,          -> goal_x - robot_x
+    #     dy,          -> goal_y - robot_y
+    #     heading,
+    #     east_wall,
+    #     north_wall,
+    #     west_wall,
+    #     south_wall
+    # )
+    #
+    # Wall:
+    # 1 = BLOCKED
+    # 0 = OPEN
+    #
+    # IMPORTANT: the state deliberately does NOT include the
+    # robot's absolute (x, y) or the goal's absolute (x, y).
+    # Only the relative offset to the goal is included. This is
+    # what makes the learned Q-table maze-independent: the same
+    # state ("goal is 2 cells east, walls open to the east") means
+    # the same thing in any maze layout, including one the agent
+    # has never physically seen before.
+    # ============================================================
 
-    ##########################################################
-    # REWARD
-    ##########################################################
+    def get_state(self):
 
-    def compute_reward(self, action_valid, already_visited, reached_goal):
-        """
-        Isolated reward function -- step() only calls this, so reward
-        shaping can be tuned here without touching movement logic.
-        """
+        robot_x, robot_y = self.robot
 
-        if not action_valid:
-            return self.INVALID_MOVE_PENALTY
+        goal_x, goal_y = self.goal
 
-        if reached_goal:
-            return self.GOAL_REWARD
+        dx = goal_x - robot_x
+        dy = goal_y - robot_y
 
-        reward = self.STEP_PENALTY
+        walls = self.get_current_walls()
 
-        if already_visited:
-            reward += self.REVISIT_PENALTY
+        east_wall = int(walls[self.EAST])
+        north_wall = int(walls[self.NORTH])
+        west_wall = int(walls[self.WEST])
+        south_wall = int(walls[self.SOUTH])
 
-        return reward
+        return (
 
-    ##########################################################
+            dx,
+            dy,
+
+            self.heading,
+
+            east_wall,
+            north_wall,
+            west_wall,
+            south_wall,
+        )
+
+    # ============================================================
     # STEP
-    ##########################################################
+    # ============================================================
 
     def step(self, action):
 
-        self.current_steps += 1
+        self.steps += 1
 
-        # The robot turns to face `action`'s direction and its
-        # sensors read the cell it's currently standing in. This is
-        # the "sensing" step -- it happens before we know whether the
-        # move itself will succeed, and it only ever tells the robot
-        # about the cell it's already in, never the destination cell.
+        # Robot heading becomes chosen movement direction
         self.heading = action
-        self.scan_current_cell()
 
-        # --- (1) "Can the agent choose this action?" is answered
-        # separately and only informationally, via
-        # get_valid_actions() / get_discovered_valid_actions(), which
-        # a training loop can consult to mask/bias action selection.
-        # step() itself does not use discovered knowledge to reject
-        # actions -- if it did, the INVALID_MOVE_PENALTY could never
-        # fire and the agent could never learn from a genuine mistake.
-        #
-        # --- (2) "Did the robot actually hit a wall?" is answered
-        # purely from ground truth (is_valid_move / blocked_edges),
-        # never from discovered_walls.
-        if not self.is_valid_move(action):
-            reward = self.compute_reward(
-                action_valid=False,
-                already_visited=False,
-                reached_goal=False
+        old_position = self.robot
+
+        # Invalid move
+        if self.is_true_wall(
+            self.robot,
+            action
+        ):
+
+            reward = self.INVALID_MOVE_PENALTY
+
+            done = False
+
+        else:
+
+            dx, dy = self.DIRECTIONS[action]
+
+            next_position = (
+
+                self.robot[0] + dx,
+                self.robot[1] + dy,
             )
-            done = self.current_steps >= self.max_steps
-            if done:
-                reward = self.TIMEOUT_PENALTY
 
-            return self.get_state(), reward, done
+            self.robot = next_position
 
-        x, y = self.robot
-        dx, dy = self.DELTA[action]
+            # Sensor discovers new cell
+            self.scan_current_cell()
 
-        new_position = (x + dx, y + dy)
+            # Goal
+            if self.robot == self.goal:
 
-        already_visited = new_position in self.visited
-        reached_goal = new_position == self.goal
+                reward = self.GOAL_REWARD
 
-        self.robot = new_position
-        self.visited.add(new_position)
+                done = True
 
-        # Sense the newly-entered cell (no-op if already scanned on a
-        # previous visit).
-        self.scan_current_cell()
+            # Revisiting
+            elif self.robot in self.visited:
 
-        reward = self.compute_reward(
-            action_valid=True,
-            already_visited=already_visited,
-            reached_goal=reached_goal
-        )
+                reward = self.REVISIT_PENALTY
 
-        done = reached_goal
+                done = False
 
-        if not done and self.current_steps >= self.max_steps:
+            # New cell
+            else:
+
+                self.visited.add(
+                    self.robot
+                )
+
+                reward = self.STEP_PENALTY
+
+                done = False
+
+            # --------------------------------------------------
+            # DISTANCE SHAPING
+            #
+            # Only applied on real (non-invalid-move) steps that
+            # aren't already terminal, and added on top of
+            # whichever base reward above already applies. A move
+            # that gets 1 cell closer to the goal earns
+            # +DISTANCE_SHAPING_WEIGHT; a move that gets 1 cell
+            # farther (i.e. most backtracking) costs
+            # -DISTANCE_SHAPING_WEIGHT, every single step - not
+            # just at the end of an episode. That is what gives
+            # forward-vs-backward actions a consistent, dense gap
+            # to learn from instead of only separating out via the
+            # sparse goal/revisit rewards.
+            # --------------------------------------------------
+
+            if self.DISTANCE_SHAPING_WEIGHT and not done:
+
+                old_distance = self.manhattan_distance(
+                    old_position,
+                    self.goal
+                )
+
+                new_distance = self.manhattan_distance(
+                    self.robot,
+                    self.goal
+                )
+
+                reward += self.DISTANCE_SHAPING_WEIGHT * (
+                    old_distance - new_distance
+                )
+
+        # Timeout
+        if (
+            not done
+            and
+            self.steps >= self.max_steps
+        ):
+
             reward = self.TIMEOUT_PENALTY
+
             done = True
 
-        return self.get_state(), reward, done
+        return (
 
-    ##########################################################
-    # ALL STATES (Q-table initialization)
-    ##########################################################
+            self.get_state(),
 
-    def get_all_states(self):
-        """
-        DEPRECATED for Q-table pre-population.
+            reward,
 
-        With the old (robot, goal) state, every state was known in
-        advance, so a dense table could be built up front. With
-        heading + discovered front/left/right/back walls in the
-        state, the state space includes configurations that are
-        either unreachable or simply never visited in a given run
-        (e.g. "back wall known blocked" states can't occur at cells
-        adjacent to the boundary the robot entered from), so
-        pre-populating a dense table wastes a lot of memory for
-        entries that will never be looked up.
+            done,
+        )
 
-        Prefer new_q_table() below: a defaultdict that creates
-        zeroed Q-values lazily, the first time a state is actually
-        seen. This method is kept only for callers that still expect
-        a full state list; wall bits are enumerated as all-zero
-        (i.e. "nothing discovered yet") placeholders and don't
-        reflect any particular episode's discoveries.
-        """
+    # ============================================================
+    # DEBUG
+    # ============================================================
 
-        states = []
+    def print_discovered_walls(self):
 
-        for rx in range(self.GRID_SIZE):
-            for ry in range(self.GRID_SIZE):
-                for gx in range(self.GRID_SIZE):
-                    for gy in range(self.GRID_SIZE):
+        print()
 
-                        if (rx, ry) == (gx, gy):
-                            continue
+        print("Discovered Walls:")
 
-                        for heading in self.ACTIONS:
-                            states.append(
-                                (rx, ry, gx, gy, heading, 0, 0, 0, 0)
-                            )
+        for position in sorted(
+            self.discovered_walls.keys()
+        ):
 
-        return states
+            print(
 
-    @classmethod
-    def default_q_values(cls):
-        """Zeroed Q-value row, one entry per action."""
-        return [0.0 for _ in cls.ACTIONS]
+                position,
 
-    @classmethod
-    def new_q_table(cls):
-        """
-        A Q-table that initializes rows lazily as states are actually
-        encountered during training, instead of enumerating the full
-        (much larger, mostly-unused) discovered-wall state space up
-        front. Usage: q_table[state][action].
-        """
-        return defaultdict(cls.default_q_values)
+                self.discovered_walls[
+                    position
+                ]
+            )
 
-    ##########################################################
-    # VALID ACTIONS (so the agent only chooses among legal moves)
-    ##########################################################
+    def print_current_information(self):
 
-    def get_valid_actions(self):
-        """
-        Actions available to the agent right now.
+        print()
 
-        This is deliberately delegated to
-        get_discovered_valid_actions() rather than checking
-        is_valid_move() against the full ground-truth wall map: the
-        agent should only ever be offered choices consistent with
-        what it has actually sensed, not the complete maze layout.
-        """
-        return self.get_discovered_valid_actions()
+        print(
+            "Robot Position:",
+            self.robot
+        )
 
-    ##########################################################
-    # RENDER
-    ##########################################################
+        print(
+            "Goal Position:",
+            self.goal
+        )
 
-    def render(self):
+        print(
+            "Heading:",
+            self.heading
+        )
 
-        print("-------------------------")
+        print(
+            "Current Walls:",
+            self.get_current_walls()
+        )
 
-        for y in reversed(range(self.GRID_SIZE)):
+        print(
+            "Valid Actions:",
+            self.get_valid_actions()
+        )
 
-            row = ""
-
-            for x in range(self.GRID_SIZE):
-
-                if (x, y) == self.robot:
-                    row += " R "
-
-                elif (x, y) == self.goal:
-                    row += " G "
-
-                else:
-                    row += " . "
-
-            print(row)
-
-        print("-------------------------")
-
-
-if __name__ == "__main__":
-    # Quick manual sanity check: confirm wall blocking, heading
-    # tracking, and the discovered-vs-ground-truth split all behave
-    # as expected.
-    HEADING_NAMES = {
-        MazeEnvironment.EAST: "EAST",
-        MazeEnvironment.NORTH: "NORTH",
-        MazeEnvironment.WEST: "WEST",
-        MazeEnvironment.SOUTH: "SOUTH",
-    }
-
-    env = MazeEnvironment()
-    state = env.reset(start=(0, 1), goal=(4, 4))
-    env.render()
-    print(f"Initial state: {state}")
-    print(f"Heading: {HEADING_NAMES[env.heading]}")
-    print(f"Discovered-valid actions from (0,1): "
-          f"{[HEADING_NAMES[a] for a in env.get_valid_actions()]}")
-
-    print()
-    print("Attempting to move NORTH (ground truth will decide outcome):")
-    state, reward, done = env.step(env.NORTH)
-    print(f"  new state: {state}, reward: {reward}, done: {done}")
-    print(f"  heading now: {HEADING_NAMES[env.heading]}")
+        print(
+            "State (dx, dy, heading, E, N, W, S):",
+            self.get_state()
+        )
