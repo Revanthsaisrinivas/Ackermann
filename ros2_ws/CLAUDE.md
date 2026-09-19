@@ -106,10 +106,47 @@ past the threshold and it gets reported OPEN.
 
 ## Testing without the GUI
 
-`gzclient` is the slow part and needs a display. For headless iteration add
-a `gui` launch argument and skip it, or run `gzserver` directly against
-`worlds/maze.world`. Always bound automated runs, e.g. `timeout 180 ...`,
-since both the launch and the policy block indefinitely on failure.
+`gzclient` is the slow part and needs a display. The `gui` launch argument
+now exists — pass `gui:=false` to run `gzserver` alone:
+
+```bash
+ros2 launch robot_description gazebo.launch.py \
+    x_cell:=0 y_cell:=0 heading:=0 drive_mode:=diff gui:=false
+```
+
+Always bound automated runs, e.g. `timeout 180 ...`, since both the launch
+and the policy block indefinitely on failure.
+
+**`timeout` on `ros2 launch` orphans `gzserver`.** The launch process dies
+but its child keeps the port, so the next launch fails with
+`bind: Address already in use` and the robot never spawns — `/scan` simply
+has no publisher. Clean up by exact name after every bounded run:
+
+```bash
+pkill -x gzserver; pkill -x gzclient
+```
+
+Use `-x`. A bare `pkill -f gazebo` also matches the shell running it, which
+has already killed a wrapper mid-command in this project.
+
+## Checking the LIDAR against the trained observation
+
+```bash
+# with Gazebo up (gui:=false is fine)
+.venv-drl/bin/python -m robot_controller.sac_evaluate --check-scan
+```
+
+Measured on `maze.world`: beam count, `angle_min`, `range_min` and
+`range_max` all match `robot_constants.py`. Two findings worth knowing:
+
+- `angle_increment` is `2*pi/359`, not `2*pi/360` — Gazebo treats
+  `angle_min` and `angle_max` as both inclusive, so the last beam
+  duplicates the first. It accumulates to 1.0° by beam 359, which is
+  0.10 of a 10° sector, below the min-pooling resolution.
+- The out-of-range encoding is **unexercised here, not verified**. In a
+  5 m maze every direction has a wall inside the 6 m sensor range, so no
+  beam ever exceeds `range_max`. It cannot affect the policy in this
+  world. Testing it needs an open world.
 
 ## Do not commit
 

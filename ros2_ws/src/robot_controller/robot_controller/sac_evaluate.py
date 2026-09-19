@@ -136,6 +136,32 @@ def check_scan(topic="/scan", n_msgs=20, timeout_s=20.0):
         w = f"{want:.5f}" if isinstance(want, float) else str(want)
         print(f"  {label:<18} {a:>12} {w:>12}   {'ok' if ok else 'MISMATCH'}")
 
+    # A per-beam increment can sit inside tolerance and still accumulate
+    # into a real angular offset by the last beam, which shifts which
+    # sector a return lands in. Report the cumulative drift, since that
+    # is the number that decides whether it matters.
+    drift = abs(m.angle_increment - expected_inc) * (len(m.ranges) - 1)
+
+    if drift > math.radians(0.5):
+
+        inc_359 = (2.0 * math.pi) / (len(m.ranges) - 1)
+
+        print(f"\n  NOTE  angle_increment accumulates to {math.degrees(drift):.2f} "
+              f"deg of drift by the last beam.")
+
+        if abs(m.angle_increment - inc_359) < 1e-6:
+            print(f"        The value is exactly 2*pi/{len(m.ranges) - 1}, not "
+                  f"2*pi/{len(m.ranges)}: this driver treats angle_min and")
+            print("        angle_max as BOTH inclusive, so the last beam "
+                  "duplicates the first.")
+
+        sector_deg = 360.0 / 36
+        print(f"        Sectors are {sector_deg:.0f} deg wide, so this is "
+              f"{math.degrees(drift) / sector_deg:.2f} of one sector - "
+              f"below the")
+        print("        min-pooling resolution, and it does not invalidate "
+              "the policy.")
+
     # ---- how does this driver say "nothing there"? ----
     n = ranges.size
     n_inf = int(np.isinf(ranges).sum())
@@ -181,10 +207,34 @@ def check_scan(topic="/scan", n_msgs=20, timeout_s=20.0):
             print(f"        {label}: got {actual}, trained on {want}")
         return 1
 
-    print("  PASS  live /scan matches the trained geometry, and this driver")
-    print(f"        encodes 'no return' as "
-          f"{'inf' if n_inf else 'range_max' if n_atmax else 'n/a'}, which")
-    print("        normalises to 1.0 exactly as training assumed.")
+    print("  PASS  live /scan geometry matches the trained observation.")
+
+    # Do NOT claim the encoding was verified when no beam was out of
+    # range. In a 5 m maze with walls inside 6 m in every direction,
+    # that is the normal case, and an earlier version of this check
+    # printed PASS on a question it had not tested.
+    if n_inf:
+        print("        'no return' is encoded as inf -> normalises to 1.0, "
+              "as training assumed.")
+    elif n_atmax:
+        print("        'no return' is encoded as range_max -> normalises to "
+              "1.0, as training assumed.")
+    else:
+        print()
+        print("  INCONCLUSIVE on the out-of-range encoding: not one beam of")
+        print(f"        {n} exceeded range_max, so this run never exercised "
+              f"it.")
+        print(f"        Nearest/farthest sector this pose: "
+              f"{obs.min():.3f} / {obs.max():.3f} normalised "
+              f"(1.0 = ceiling).")
+        print("        In a 5 m maze every direction has a wall inside the "
+              "6 m")
+        print("        sensor range, so the encoding cannot arise here and "
+              "cannot")
+        print("        affect the policy in this world. To actually test it, "
+              "run")
+        print("        this against an open world, or accept it as "
+              "unexercised.")
 
     return 0
 

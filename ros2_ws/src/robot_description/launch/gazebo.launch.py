@@ -144,15 +144,24 @@ def launch_setup(context, *args, **kwargs):
         output="screen"
     )
 
+    # gzclient is the slow part and needs a display. Automated checks
+    # (policy rollouts, sac_evaluate --check-scan) only need gzserver,
+    # and skipping the GUI leaves the cores for whatever is being
+    # measured.
+    show_gui = context.perform_substitution(
+        LaunchConfiguration("gui")
+    ).lower() not in ("false", "0", "no")
+
+    delayed = [spawn_robot]
+    if show_gui:
+        delayed.insert(0, gzclient)
+
     actions = [
         gzserver,
         robot_state_publisher,
         TimerAction(
             period=2.0,
-            actions=[
-                gzclient,
-                spawn_robot
-            ]
+            actions=delayed
         ),
     ]
 
@@ -193,6 +202,13 @@ def generate_launch_description():
             "drive_mode",
             default_value="diff",
             description="diff = pivot-capable differential; ackermann = car-like"
+        ),
+        DeclareLaunchArgument(
+            "gui",
+            default_value="true",
+            description="false runs gzserver only - headless, no display "
+                        "needed, and leaves the cores free for the run "
+                        "being measured"
         ),
         DeclareLaunchArgument(
             "use_slam",
