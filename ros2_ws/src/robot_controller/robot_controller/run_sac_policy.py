@@ -46,6 +46,7 @@ from . import sac_model_path
 from .robot_constants import (
     CONTROL_HZ,
     DEPLOY_CELL_SIZE,
+    GOAL_RADIUS,
     LIDAR_BEAMS,
     MAX_STEER,
     V_MAX,
@@ -107,7 +108,8 @@ class SafetyGovernor:
 
 class SacPolicyNode(Node):
 
-    def __init__(self, goal_cell, checkpoint, drive_mode, cell_size):
+    def __init__(self, goal_cell, start_cell, checkpoint, drive_mode,
+                 cell_size):
 
         super().__init__("sac_policy")
 
@@ -117,6 +119,19 @@ class SacPolicyNode(Node):
         self.goal = np.array([
             (goal_cell[0] + 0.5) * cell_size,
             (goal_cell[1] + 0.5) * cell_size,
+        ])
+
+        # World position of the start cell centre. Odometry reads (0,0)
+        # wherever the robot spawned, so every pose has to be shifted by
+        # this to land in the frame the goal is expressed in.
+        #
+        # Set here, not patched onto the node from main() afterwards:
+        # _control reads it, and a timer callback that fired before the
+        # attribute existed would die with AttributeError inside a
+        # callback, where it is easy to miss.
+        self.goal_origin = np.array([
+            (start_cell[0] + 0.5) * cell_size,
+            (start_cell[1] + 0.5) * cell_size,
         ])
 
         self.drive_mode = drive_mode
@@ -242,7 +257,9 @@ class SacPolicyNode(Node):
 
         self.steps += 1
 
-        if math.hypot(dx, dy) < 0.20:
+        # Same threshold the simulator paid R_GOAL at - see
+        # robot_constants.GOAL_RADIUS.
+        if math.hypot(dx, dy) < GOAL_RADIUS:
             self.get_logger().info(
                 f"GOAL REACHED in {self.steps} steps "
                 f"({self.governor.vetoes} safety vetoes)"
@@ -273,17 +290,11 @@ def main(args=None):
 
     node = SacPolicyNode(
         tuple(cli.goal),
+        tuple(cli.start),
         sac_model_path.checkpoint_path(cli.name),
         cli.drive_mode,
         cli.cell_size,
     )
-
-    # World position of the start cell centre; odometry is relative to
-    # wherever the robot spawned.
-    node.goal_origin = np.array([
-        (cli.start[0] + 0.5) * cli.cell_size,
-        (cli.start[1] + 0.5) * cli.cell_size,
-    ])
 
     try:
         rclpy.spin(node)

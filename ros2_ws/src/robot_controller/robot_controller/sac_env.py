@@ -77,7 +77,10 @@ from .sac_observation import (
 )
 
 
-GOAL_RADIUS = 0.20
+# Re-exported for callers that already import it from here. The
+# definition lives in robot_constants so the deployment node cannot
+# drift from the trainer.
+from .robot_constants import GOAL_RADIUS  # noqa: E402,F401
 
 
 # ============================================================

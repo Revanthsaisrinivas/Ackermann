@@ -141,6 +141,14 @@ DEPLOY_GRID_SIZE = 5
 DEPLOY_CELL_SIZE = 1.0
 WALL_THICKNESS = 0.10
 
+# How close counts as "arrived". This lives here, not in sac_env, because
+# BOTH the trainer and the deployment node have to agree on it: the
+# simulator uses it to decide when to pay R_GOAL, and run_sac_policy uses
+# it to decide when to stop the robot. It was duplicated as a bare 0.20
+# literal in run_sac_policy, so raising it in training would have left
+# the real robot still declaring success at the old distance.
+GOAL_RADIUS = 0.20
+
 
 def body_polygon(x, y, yaw):
     """Corners of the body rectangle, given a REAR-AXLE pose.
