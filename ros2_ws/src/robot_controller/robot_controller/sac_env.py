@@ -20,12 +20,17 @@ beams:
 OUT-OF-RANGE RETURNS
 --------------------
 Gazebo's ray sensor and this simulator may disagree on what "no return"
-is - `inf` in some versions, `range_max` in others. That disagreement
-cannot reach the policy: `sac_observation.downsample_scan` maps
-non-finite values to `LIDAR_RANGE_MAX` and then clips to
-`LIDAR_NORM_MAX` (3.0 < 6.0), so `inf` and `6.0` both normalise to
-exactly 1.0. The raw value is still worth confirming against a recorded
-/scan, which `sac_evaluate.py --check-scan` does.
+is - `inf` in some versions, `range_max` in others. Those two cannot
+reach the policy: `sac_observation.downsample_scan` maps non-finite
+values to `LIDAR_RANGE_MAX` and then clips to `LIDAR_NORM_MAX`
+(3.0 < 6.0), so `inf` and `6.0` both normalise to exactly 1.0.
+
+A third encoding is NOT harmless, and is the reason the check exists.
+Some drivers report "no return" as 0.0. That clips UP to
+`LIDAR_RANGE_MIN` and normalises to 0.0 - the encoding for "obstacle
+against the bumper" - so every open direction would read as a wall.
+`sac_evaluate.py --check-scan` measures a live /scan and fails loudly
+on any sub-range_min value.
 
 UNKNOWN MAZE
 ------------

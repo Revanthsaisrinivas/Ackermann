@@ -37,9 +37,156 @@ import numpy as np
 
 from . import sac_model_path
 from .maze_memory import MazeMemory
-from .robot_constants import DEPLOY_CELL_SIZE, DEPLOY_GRID_SIZE
+from .robot_constants import (
+    DEPLOY_CELL_SIZE,
+    DEPLOY_GRID_SIZE,
+    LIDAR_ANGLE_MIN,
+    LIDAR_BEAMS,
+    LIDAR_NORM_MAX,
+    LIDAR_RANGE_MAX,
+    LIDAR_RANGE_MIN,
+)
 from .sac_agent import SAC
 from .sac_env import SacMazeEnv, GOAL_RADIUS
+
+
+# ============================================================
+# --check-scan : confirm the real /scan against the trained geometry
+# ============================================================
+
+def check_scan(topic="/scan", n_msgs=20, timeout_s=20.0):
+    """Compare a live /scan against what the observation builder assumes.
+
+    WHAT THIS IS ACTUALLY LOOKING FOR
+    ---------------------------------
+    `downsample_scan` maps non-finite beams to LIDAR_RANGE_MAX and then
+    clips into [LIDAR_RANGE_MIN, LIDAR_NORM_MAX]. So the two common
+    "no return" encodings are both harmless:
+
+        inf -> RANGE_MAX -> clipped to NORM_MAX -> normalises to 1.0
+        6.0 -> 6.0       -> clipped to NORM_MAX -> normalises to 1.0
+
+    But a driver that encodes "no return" as 0.0 - and some do - is NOT
+    harmless. 0.0 clips UP to LIDAR_RANGE_MIN and normalises to 0.0,
+    which is the encoding for "obstacle against the bumper". Every open
+    direction would read as a wall. The policy would be correct and the
+    sensor would be lying to it.
+
+    A below-range_min reading is therefore the finding this exists to
+    catch, not the inf-vs-range_max question the sac_env docstring
+    originally framed it as.
+
+    Run with Gazebo up:
+
+        .venv-drl/bin/python -m robot_controller.sac_evaluate --check-scan
+    """
+
+    import rclpy
+    from rclpy.node import Node
+    from sensor_msgs.msg import LaserScan
+
+    from .sac_observation import downsample_scan
+
+    rclpy.init()
+
+    node = Node("scan_check")
+    got = []
+
+    node.create_subscription(
+        LaserScan, topic, lambda m: got.append(m), 10
+    )
+
+    print(f"listening on {topic} for up to {timeout_s:.0f} s ...")
+
+    deadline = time.time() + timeout_s
+
+    while len(got) < n_msgs and time.time() < deadline and rclpy.ok():
+        rclpy.spin_once(node, timeout_sec=0.5)
+
+    node.destroy_node()
+    rclpy.shutdown()
+
+    if not got:
+        print(f"\nFAIL  no messages on {topic}. Is Gazebo running?")
+        return 1
+
+    print(f"received {len(got)} messages\n")
+
+    m = got[0]
+    ranges = np.concatenate([np.asarray(s.ranges, np.float64) for s in got])
+
+    expected_inc = (2.0 * math.pi) / LIDAR_BEAMS
+
+    checks = [
+        ("beam count", len(m.ranges), LIDAR_BEAMS,
+         len(m.ranges) == LIDAR_BEAMS),
+        ("angle_min", m.angle_min, LIDAR_ANGLE_MIN,
+         abs(m.angle_min - LIDAR_ANGLE_MIN) < 1e-3),
+        ("angle_increment", m.angle_increment, expected_inc,
+         abs(m.angle_increment - expected_inc) < 1e-4),
+        ("range_min", m.range_min, LIDAR_RANGE_MIN,
+         abs(m.range_min - LIDAR_RANGE_MIN) < 1e-2),
+        ("range_max", m.range_max, LIDAR_RANGE_MAX,
+         abs(m.range_max - LIDAR_RANGE_MAX) < 1e-2),
+    ]
+
+    print(f"  {'field':<18} {'measured':>12} {'expected':>12}   result")
+    for label, actual, want, ok in checks:
+        a = f"{actual:.5f}" if isinstance(actual, float) else str(actual)
+        w = f"{want:.5f}" if isinstance(want, float) else str(want)
+        print(f"  {label:<18} {a:>12} {w:>12}   {'ok' if ok else 'MISMATCH'}")
+
+    # ---- how does this driver say "nothing there"? ----
+    n = ranges.size
+    n_inf = int(np.isinf(ranges).sum())
+    n_nan = int(np.isnan(ranges).sum())
+    finite = ranges[np.isfinite(ranges)]
+    n_atmax = int((finite >= LIDAR_RANGE_MAX - 1e-3).sum())
+    n_zero = int((finite <= 1e-6).sum())
+    n_under = int(((finite > 1e-6) & (finite < LIDAR_RANGE_MIN)).sum())
+
+    print(f"\n  out-of-range encoding, over {n} beams:")
+    print(f"    inf                     {n_inf:7d}  ({n_inf / n:5.1%})")
+    print(f"    nan                     {n_nan:7d}  ({n_nan / n:5.1%})")
+    print(f"    >= range_max            {n_atmax:7d}  ({n_atmax / n:5.1%})")
+    print(f"    exactly 0.0             {n_zero:7d}  ({n_zero / n:5.1%})")
+    print(f"    0 < r < range_min       {n_under:7d}  ({n_under / n:5.1%})")
+
+    obs = downsample_scan(np.asarray(m.ranges, np.float32))
+
+    print(f"\n  downsample_scan -> {obs.shape[0]} sectors, "
+          f"min {obs.min():.3f} max {obs.max():.3f}")
+
+    bad = (obs < -1e-6).any() or (obs > 1.0 + 1e-6).any()
+
+    failed = [c for c in checks if not c[3]]
+
+    print()
+
+    if n_zero or n_under:
+        print("  FAIL  this driver reports sub-range_min values. Those clip UP")
+        print("        to LIDAR_RANGE_MIN and normalise to 0.0, which the")
+        print("        policy reads as an obstacle against the bumper. If they")
+        print("        mean 'no return', downsample_scan must map them to")
+        print("        LIDAR_RANGE_MAX alongside the non-finite case.")
+        return 1
+
+    if bad:
+        print("  FAIL  normalised sectors left [0, 1].")
+        return 1
+
+    if failed:
+        print("  FAIL  geometry differs from the trained observation:")
+        for label, actual, want, _ in failed:
+            print(f"        {label}: got {actual}, trained on {want}")
+        return 1
+
+    print("  PASS  live /scan matches the trained geometry, and this driver")
+    print(f"        encodes 'no return' as "
+          f"{'inf' if n_inf else 'range_max' if n_atmax else 'n/a'}, which")
+    print("        normalises to 1.0 exactly as training assumed.")
+
+    return 0
 
 
 # ============================================================
@@ -185,7 +332,14 @@ def main():
     p.add_argument("--name", default="policy")
     p.add_argument("--mazes", type=int, default=100)
     p.add_argument("--seed", type=int, default=12345)
+    p.add_argument("--check-scan", action="store_true",
+                   help="compare a live /scan against the trained geometry "
+                        "and exit (needs Gazebo up; no checkpoint required)")
+    p.add_argument("--scan-topic", default="/scan")
     args = p.parse_args()
+
+    if args.check_scan:
+        raise SystemExit(check_scan(args.scan_topic))
 
     ckpt = sac_model_path.checkpoint_path(args.name)
 
