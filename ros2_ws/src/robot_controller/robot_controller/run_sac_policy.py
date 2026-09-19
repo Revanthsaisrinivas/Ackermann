@@ -34,6 +34,7 @@ import math
 import numpy as np
 
 import rclpy
+from rclpy.executors import ExternalShutdownException
 from rclpy.node import Node
 
 from geometry_msgs.msg import Twist
@@ -189,8 +190,24 @@ class SacPolicyNode(Node):
     # ----------------------------------------------------
 
     def _stop(self):
+        """Zero the wheels. Safe to call after shutdown has begun.
 
-        self.cmd_pub.publish(Twist())
+        _control calls rclpy.shutdown() on arrival and main()'s finally
+        calls this again on the way out, so the second call lands on a
+        dead context. Without the guard every SUCCESSFUL run ended in
+        `RCLError: publisher's context is invalid` and looked like a
+        crash - which is worse than cosmetic during validation, because
+        it buries the real errors it is meant to surface.
+        """
+
+        if not rclpy.ok():
+            return
+
+        try:
+            self.cmd_pub.publish(Twist())
+        except Exception:
+            # Shutting down mid-publish is not a failure to report.
+            pass
 
     def _control(self):
 
@@ -300,8 +317,13 @@ def main(args=None):
         rclpy.spin(node)
     except KeyboardInterrupt:
         pass
+    except ExternalShutdownException:
+        # Ctrl-C or SIGTERM from a `timeout` wrapper. Not an error, and
+        # bounded runs under `timeout` are the documented way to drive
+        # this, so it must not print a traceback.
+        pass
     finally:
-        node._stop()
+        node._stop()            # no-ops if the context is already down
         node.destroy_node()
         if rclpy.ok():
             rclpy.shutdown()
