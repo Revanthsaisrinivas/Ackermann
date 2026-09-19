@@ -453,6 +453,27 @@ def main():
           f"{0.0:6.1%} {1 - ok / args.mazes:6.1%}  "
           f"{np.mean(ratios) if ratios else float('nan'):6.2f}       -")
 
+    print()
+    print("  The baseline's 'sec' is blank on purpose, not missing. SAC's")
+    print("  seconds come from this simulator at a 10 Hz control rate; the")
+    print("  baseline executes cell-to-cell moves through the Gazebo")
+    print("  controller at roughly 7 s each. Printing both in one column")
+    print("  would compare a headless integrator against a physics sim and")
+    print("  flatter whichever ran in the cheaper one.")
+    print()
+    print("  path/opt is the honest cross-system comparison: both are")
+    print("  measured against the same BFS shortest path, and it is")
+    print("  dimensionless, so neither clock enters it.")
+    print()
+    print("  One asymmetry in it, and it favours the BASELINE. The DFS")
+    print("  ratio counts cell moves, i.e. the cell-centre polyline, which")
+    print("  is the shortest path a cell-level planner could possibly")
+    print("  drive. The real robot cannot drive it - a 0.369 m minimum")
+    print("  turning radius means every corner is an arc - so the baseline's")
+    print("  true driven distance is longer than what is printed here.")
+    print("  SAC's ratio is measured actual travel, arcs included. Read the")
+    print("  baseline's path/opt as a lower bound and SAC's as exact.")
+
     # ---- maze.world, all 24 start cells ----------------
     print("\nmaze.world, all 24 start cells -> (4,4)   [NEVER TRAINED ON]")
     print(header)
