@@ -15,6 +15,10 @@
   <buildtool_depend>ament_python</buildtool_depend>
 
   <depend>rclpy</depend>
+  <!-- SAC policy. Installed in the project venv
+       (.venv-drl); rosdep has no key for the CPU
+       wheel index, so this is declarative only. -->
+  <exec_depend>python3-torch</exec_depend>
 
   <test_depend>ament_lint_auto</test_depend>
   <test_depend>ament_lint_common</test_depend>

@@ -20,6 +20,10 @@ setup(
         'package.xml',
     ]),
 ],
+    # torch is intentionally NOT in install_requires: colcon
+    # would try to resolve it from PyPI and pull the CUDA
+    # build. It lives in .venv-drl, installed from the CPU
+    # wheel index. See CLAUDE.md.
     install_requires=['setuptools'],
     zip_safe=True,
     maintainer='revanth',
@@ -36,6 +40,9 @@ setup(
         'obstacle_avoidance = robot_controller.obstacle_avoidance:main',
         'train = robot_controller.train:main',
         'run_policy = robot_controller.run_policy:main',
+        'run_sac_policy = robot_controller.run_sac_policy:main',
+        'sac_train = robot_controller.sac_train:main',
+        'sac_evaluate = robot_controller.sac_evaluate:main',
     ],
 },
 )
