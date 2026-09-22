@@ -3,6 +3,8 @@
 import random
 from collections import deque
 
+from . import maze_layout
+
 
 class MazeEnvironment:
 
@@ -52,45 +54,45 @@ class MazeEnvironment:
     # ties described above. Set to 0.0 to disable.
     DISTANCE_SHAPING_WEIGHT = 0.5
 
-    def __init__(self):
+    def __init__(self, blocked_edges=None):
 
         # ----------------------------------------------------
         # HIDDEN MAZE
         #
-        # The agent does NOT directly receive blocked_edges.
-        # It only receives sensor wall observations.
+        # The agent does NOT directly receive blocked_edges. It only
+        # receives sensor wall observations, and the executor never
+        # reads this set at all.
         #
-        # This default layout is only used if you construct
-        # MazeEnvironment() and never call randomize_maze() /
-        # reset(randomize_maze=True). For TRAINING that is meant
-        # to generalize to an unknown physical maze, you should
-        # randomize the maze every episode (see train.py), so the
-        # agent never gets to memorize one specific layout.
+        # The layout is parsed from worlds/maze.world, so the walls the
+        # trainer learns are by construction the walls Gazebo spawns.
+        # It used to be a hand-written copy kept here, which nothing
+        # checked against the world file.
+        #
+        # Pass `blocked_edges` to train on some other fixed layout, or
+        # call reset(randomize_maze=True) for the old domain-randomised
+        # behaviour. Fixed-maze training is now the default: see
+        # train.py for why.
         # ----------------------------------------------------
 
-        self.blocked_edges = {
+        if blocked_edges is not None:
 
-            frozenset({(2, 4), (3, 4)}),
-            frozenset({(3, 4), (4, 4)}),
+            self.blocked_edges = set(blocked_edges)
 
-            frozenset({(2, 3), (2, 4)}),
+            self.layout_signature = maze_layout.signature(
+                self.blocked_edges
+            )
 
-            frozenset({(1, 2), (1, 3)}),
+            self.layout_source = "caller-supplied"
 
-            frozenset({(2, 2), (2, 3)}),
-            frozenset({(2, 2), (3, 2)}),
+        else:
 
-            frozenset({(3, 1), (4, 1)}),
-            frozenset({(3, 2), (4, 2)}),
+            self.blocked_edges = maze_layout.blocked_edges()
 
-            frozenset({(2, 1), (2, 2)}),
+            self.layout_signature = maze_layout.signature(
+                self.blocked_edges
+            )
 
-            frozenset({(0, 0), (0, 1)}),
-
-            frozenset({(1, 0), (1, 1)}),
-
-            frozenset({(3, 0), (3, 1)}),
-        }
+            self.layout_source = maze_layout.world_path()
 
         self.robot = (0, 0)
         self.goal = (4, 4)
@@ -103,6 +105,16 @@ class MazeEnvironment:
 
         self.max_steps = 100
         self.steps = 0
+
+        # The revisit penalty reads self.visited, which is episode
+        # history and is NOT part of the state. That makes the reward
+        # non-Markov: the same state can pay -5 or -1 depending on how
+        # the robot got there, and Q-learning then averages over paths
+        # instead of converging. It is harmless under domain
+        # randomisation, where nothing converges tightly anyway, but it
+        # is exactly what puts near-ties into a fixed-maze table.
+        # train.py turns it off; nothing else does.
+        self.use_revisit_penalty = True
 
     # ============================================================
     # RESET
@@ -368,29 +380,46 @@ class MazeEnvironment:
         return valid_actions
 
     # ============================================================
-    # RELATIVE 7-VALUE STATE
+    # ABSOLUTE 5-VALUE STATE
     #
     # (
-    #     dx,          -> goal_x - robot_x
-    #     dy,          -> goal_y - robot_y
-    #     heading,
-    #     east_wall,
-    #     north_wall,
-    #     west_wall,
-    #     south_wall
+    #     robot_x,
+    #     robot_y,
+    #     goal_x,
+    #     goal_y,
+    #     heading
     # )
     #
-    # Wall:
-    # 1 = BLOCKED
-    # 0 = OPEN
+    # WHY ABSOLUTE, AND WHY THE WALL BITS ARE GONE
+    # --------------------------------------------
+    # The state used to be the relative 7-tuple
+    # (dx, dy, heading, east, north, west, south), chosen so one table
+    # would transfer to a maze the robot had never seen.
     #
-    # IMPORTANT: the state deliberately does NOT include the
-    # robot's absolute (x, y) or the goal's absolute (x, y).
-    # Only the relative offset to the goal is included. This is
-    # what makes the learned Q-table maze-independent: the same
-    # state ("goal is 2 cells east, walls open to the east") means
-    # the same thing in any maze layout, including one the agent
-    # has never physically seen before.
+    # It does not survive contact with a single fixed maze. Relative
+    # offsets do not pin down which cell the robot is in: 2400
+    # (start, goal, heading) triples in maze.world collapse onto 1656
+    # distinct states, 608 of them shared by more than one cell. In 80
+    # of those, no single action is on a shortest path for every cell
+    # that maps there - so the encoding cannot represent an optimal
+    # policy, however long it trains. Measured ceiling for ANY policy
+    # on the 7-tuple, in this maze: 90.8% of pairs reach the goal. The
+    # other 9% loop forever, which is what the DFS fallback was
+    # quietly covering up.
+    #
+    # The absolute state has no aliasing. 25 cells x 25 goals x 4
+    # headings = 2500 states, every one enumerable, and the greedy
+    # table alone solves every solvable pair by a shortest path.
+    #
+    # The wall bits are dropped because they are now redundant: in a
+    # FIXED maze the cell determines its own walls, so carrying them
+    # added nothing the cell did not already say.
+    #
+    # THIS IS NOT THE ROBOT READING THE MAZE. The executor knows where
+    # it is (odometry) and where it was told to go. It still never
+    # reads blocked_edges, and the layout reaches it only through what
+    # training baked into the Q-values. A table is therefore valid for
+    # the maze it was trained on: change maze.world, retrain.
     # ============================================================
 
     def get_state(self):
@@ -399,27 +428,15 @@ class MazeEnvironment:
 
         goal_x, goal_y = self.goal
 
-        dx = goal_x - robot_x
-        dy = goal_y - robot_y
-
-        walls = self.get_current_walls()
-
-        east_wall = int(walls[self.EAST])
-        north_wall = int(walls[self.NORTH])
-        west_wall = int(walls[self.WEST])
-        south_wall = int(walls[self.SOUTH])
-
         return (
 
-            dx,
-            dy,
+            robot_x,
+            robot_y,
+
+            goal_x,
+            goal_y,
 
             self.heading,
-
-            east_wall,
-            north_wall,
-            west_wall,
-            south_wall,
         )
 
     # ============================================================
@@ -468,7 +485,11 @@ class MazeEnvironment:
                 done = True
 
             # Revisiting
-            elif self.robot in self.visited:
+            elif (
+                self.use_revisit_penalty
+                and
+                self.robot in self.visited
+            ):
 
                 reward = self.REVISIT_PENALTY
 
@@ -590,6 +611,6 @@ class MazeEnvironment:
         )
 
         print(
-            "State (dx, dy, heading, E, N, W, S):",
+            "State (robot_x, robot_y, goal_x, goal_y, heading):",
             self.get_state()
         )

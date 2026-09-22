@@ -34,7 +34,8 @@ source install/setup.bash && python3 -m robot_controller.train
 
 - `robot_description` — URDF/xacro, `worlds/maze.world`, `launch/gazebo.launch.py`
 - `robot_controller` — `rl_environment.py`, `q_learning.py`, `train.py`,
-  `run_policy.py`, `grid_rl_controller.py`, `maze_memory.py`
+  `run_policy.py`, `grid_rl_controller.py`, `maze_memory.py`,
+  `maze_layout.py` (parses `maze.world`; the layout's one source of truth)
 
 ## Conventions
 
@@ -42,15 +43,33 @@ source install/setup.bash && python3 -m robot_controller.train
   `(col + 0.5, row + 0.5)`. Nothing is at a negative coordinate.
 - Actions and headings: `0=EAST 1=NORTH 2=WEST 3=SOUTH`. Ties always break
   in that order.
-- RL state is the 7-tuple `(dx, dy, heading, east, north, west, south)`,
-  `1 = BLOCKED`. `dx, dy` are goal-minus-robot, never absolute position.
+- Tabular RL state is the absolute 5-tuple
+  `(robot_x, robot_y, goal_x, goal_y, heading)`. It was the relative
+  7-tuple `(dx, dy, heading, east, north, west, south)` until the
+  fixed-maze change; anything still describing that is stale.
 - The executor must never read `blocked_edges`. The maze is unknown at run
-  time; only live LIDAR plus remembered observations are allowed.
+  time; only odometry, the goal it was given, live LIDAR, remembered
+  observations and the trained Q-values are allowed. Knowing where you
+  are is not knowing where the walls are.
 
 ## Traps that have already cost time
 
-**Do not edit `worlds/maze.world`.** The layout is fixed and its 12 inner
-walls match the default `blocked_edges` in `rl_environment.py` exactly.
+**`maze.world` is the single source of truth for the layout, and the
+tabular Q-table belongs to it.** `maze_layout.py` parses the 12 inner wall
+models out of the world file; `rl_environment.py` no longer carries its own
+copy of `blocked_edges`, so the two cannot drift apart any more.
+
+If you change `worlds/maze.world`, **retrain**:
+
+```bash
+python3 -m robot_controller.train      # ~25 s, refuses to save a bad table
+```
+
+A layout signature is stamped into the table and checked at load.
+`run_policy.py` prints it, warns when the world file no longer matches, and
+reports any step the Q-table could not take. Note this applies to the
+tabular stack only — SAC holds `maze.world` out entirely and never trains
+on it.
 
 **There is exactly one `q_table.pkl`, and it is outside the workspace.**
 `robot_controller/q_table_path.py` is the only thing that decides where:
@@ -66,8 +85,14 @@ python3 -c "from robot_controller.q_table_path import describe_q_table_source as
 find build install -name q_table.pkl
 ```
 
-A correctly trained table has ~3744 states out of 5184. The copy migrated
-in from the old layout has 2456 — retrain to get back above that.
+A correctly trained table has **2456 states** and drives all 600 start/goal
+pairs by a shortest path with no fallback. `train.py` verifies that against
+BFS before writing and exits non-zero rather than save a table that fails
+it, so a saved table is a passing table.
+
+(The old domain-randomised scheme produced ~3744 states of which only 1685
+applied to this maze, 23 were missing, and the greedy policy alone solved
+65%. Any note citing 3744/5184 predates the fixed-maze change.)
 `src/robot_controller/robot_controller/q_table.pkl` is a leftover of the
 old scheme, still tracked in git and no longer read by anything.
 
@@ -100,9 +125,16 @@ past the threshold and it gets reported OPEN.
 - Optimal route `(0,0) → (4,4)` is 8 moves: E,E,E,E then N,N,N,N up the
   x=4 column.
 - Dead ends are `(0,0) (2,2) (2,4) (3,4) (4,4)`.
-- The memoryless greedy fallback livelocks at `(1,2)↔(2,2)` and
-  `(1,4)↔(2,4)`; 6 of 24 start cells never finish. `maze_memory.py` fixes
-  this — 0 failures across all 600 start/goal pairs, worst case 43 steps.
+- With a table trained on this maze, the Q-policy drives all 600 start/goal
+  pairs alone: 0 DFS steps, worst case 10. `maze_memory.py` is the net
+  underneath, not the driver.
+- The net still earns its place. With one wall moved and the table left
+  stale, `run_policy` detects the disagreement, latches to DFS and still
+  finishes 600/600. Handing back to the table after each disagreement
+  instead of latching reaches only 586/600.
+- The memoryless greedy fallback (no memory at all) livelocks at
+  `(1,2)↔(2,2)` and `(1,4)↔(2,4)`; 6 of 24 start cells never finish. That
+  is why `maze_memory.py` exists.
 
 ## Testing without the GUI
 

@@ -771,24 +771,32 @@ class GridRLController(Node):
     # ============================================================
     # GET RL STATE
     #
-    # EXACTLY MATCHES TRAINING STATE:
+    # EXACTLY MATCHES TRAINING STATE (see q_learning.STATE_FORMAT):
     #
     # (
-    #     dx,            # goal_x - robot_x
-    #     dy,            # goal_y - robot_y
-    #     heading,
-    #     east_wall,
-    #     north_wall,
-    #     west_wall,
-    #     south_wall
+    #     robot_x,
+    #     robot_y,
+    #     goal_x,
+    #     goal_y,
+    #     heading
     # )
     #
-    # The robot never knows the true maze layout: robot_cell comes
-    # from odometry (self.current_cell) and goal_cell is whatever
-    # it was told (self.goal_cell). Only the relative offset is
-    # fed to the Q-table, along with what LIDAR currently reports
-    # as open/blocked. That is what lets a Q-table trained on
-    # randomized mazes work in a physical maze it has never seen.
+    # THE ROBOT STILL DOES NOT KNOW THE MAZE. robot_cell comes from
+    # odometry (self.current_cell) and goal_cell is whatever it was
+    # told (self.goal_cell). Knowing where you are is not knowing where
+    # the walls are: this method never reads blocked_edges, and the
+    # layout reaches the policy only through Q-values that training
+    # baked in for the maze it was trained on.
+    #
+    # The wall bits that used to be part of this tuple are gone. In a
+    # fixed maze the cell already determines its own walls, so they
+    # added nothing - while the relative (dx, dy) form they came with
+    # made different cells share a state and capped any possible policy
+    # at 90.8% of start/goal pairs. See rl_environment.get_state.
+    #
+    # `walls` is still taken and still scanned, because the CALLER uses
+    # it for valid_actions and for the live-LIDAR cross-check in
+    # run_policy. It is simply no longer part of the state key.
     # ============================================================
 
     def get_state(
@@ -818,42 +826,17 @@ class GridRLController(Node):
             self.goal_cell[1]
         )
 
-        dx = goal_x - robot_x
-
-        dy = goal_y - robot_y
-
-        east_wall = int(
-            walls[self.EAST]
-        )
-
-        north_wall = int(
-            walls[self.NORTH]
-        )
-
-        west_wall = int(
-            walls[self.WEST]
-        )
-
-        south_wall = int(
-            walls[self.SOUTH]
-        )
-
         return (
 
-            dx,
+            robot_x,
 
-            dy,
+            robot_y,
+
+            goal_x,
+
+            goal_y,
 
             self.heading,
-
-            east_wall,
-
-            north_wall,
-
-            west_wall,
-
-            south_wall,
-
         )
 
     # ============================================================

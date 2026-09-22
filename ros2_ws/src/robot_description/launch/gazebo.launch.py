@@ -42,11 +42,18 @@ def launch_setup(context, *args, **kwargs):
         "robot.urdf.xacro"
     )
 
+    world_name = LaunchConfiguration("world").perform(context)
+
     world_file = os.path.join(
         pkg_path,
         "worlds",
-        "maze.world"
+        world_name
     )
+
+    if not os.path.isfile(world_file):
+        raise ValueError(
+            f"World file not found: {world_file}"
+        )
 
     drive_mode = LaunchConfiguration("drive_mode").perform(context)
 
@@ -93,6 +100,7 @@ def launch_setup(context, *args, **kwargs):
 
     print("=" * 50)
     print("Launching Maze Simulation & Controller")
+    print(f"World File: {world_file}")
     print(f"Drive Mode: {drive_mode}")
     print(f"Grid Cell : ({x_cell}, {y_cell})")
     print(f"Heading   : {heading}")
@@ -202,6 +210,13 @@ def generate_launch_description():
             "drive_mode",
             default_value="diff",
             description="diff = pivot-capable differential; ackermann = car-like"
+        ),
+        DeclareLaunchArgument(
+            "world",
+            default_value="maze.world",
+            description="World file name under robot_description/worlds "
+                        "(e.g. maze2.world). Must match whatever "
+                        "RL_MAZE_WORLD/RL_Q_TABLE were trained against."
         ),
         DeclareLaunchArgument(
             "gui",

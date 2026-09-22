@@ -25,7 +25,33 @@ ACTION_NAMES = [
 
 
 def extract_state_columns(state):
-    """Return CSV columns and values for both legacy and current state formats."""
+    """Return CSV columns and values for the current and legacy formats.
+
+    Current is the absolute 5-tuple; the 7- and 9-element branches below
+    are older encodings kept only so an archived table still opens.
+    """
+    if len(state) == 5:
+        (
+            robot_x,
+            robot_y,
+            goal_x,
+            goal_y,
+            heading,
+        ) = state
+        return [
+            "Robot X",
+            "Robot Y",
+            "Goal X",
+            "Goal Y",
+            "Heading",
+        ], [
+            robot_x,
+            robot_y,
+            goal_x,
+            goal_y,
+            heading,
+        ]
+
     if len(state) == 7:
         (
             goal_dx,

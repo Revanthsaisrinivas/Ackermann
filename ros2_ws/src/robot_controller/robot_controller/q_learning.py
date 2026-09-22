@@ -7,17 +7,23 @@ import random
 # The state encoding this agent's Q-tables are keyed on, stamped into
 # every saved file and checked on load.
 #
-# It is NOT decoration. The table shipped with this workspace was keyed
-# on an older encoding,
+# It is NOT decoration. A table keyed on a different encoding is not
+# "empty" or "undertrained": every single lookup simply misses, and the
+# policy silently runs on its fallback for the whole run without saying
+# a word. This workspace has shipped two earlier encodings,
 #
 #     robot_x_robot_y_goal_x_goal_y_heading_east_north_west_south
+#     dx_dy_heading_east_north_west_south
 #
-# a 9-tuple of absolute positions. The controller has since moved to the
-# 7-tuple relative form below. A 7-tuple can never be found in a table of
-# 9-tuples, so `state in agent.q_table` was False for every state of
-# every run - the policy silently degraded to its fallback and nothing
-# said a word. Compare this tag before trusting a loaded table.
-STATE_FORMAT = "dx_dy_heading_east_north_west_south"
+# and both failure modes cost real debugging time. Compare this tag
+# before trusting a loaded table.
+#
+# The current encoding is absolute: the robot's cell, the goal cell and
+# the heading. It is maze-SPECIFIC by design - see rl_environment's
+# get_state for why the relative form could not represent an optimal
+# policy in a fixed maze. A table is valid for the layout it was trained
+# on, which is what LAYOUT_SIGNATURE records.
+STATE_FORMAT = "robot_x_robot_y_goal_x_goal_y_heading"
 
 
 class QLearningAgent:
@@ -53,6 +59,12 @@ class QLearningAgent:
         self.epsilon_min = epsilon_min
 
         self.q_table = {}
+
+        # Set by train.py before save(), and repopulated by load().
+        # None means the table predates layout stamping.
+        self.layout_signature = None
+
+        self.layout_source = None
 
         if states is not None:
 
@@ -301,8 +313,15 @@ class QLearningAgent:
             "discount_factor":
                 self.discount_factor,
 
-            # dx = goal_x - robot_x, dy = goal_y - robot_y
             "state_format": STATE_FORMAT,
+
+            # Which maze this table was trained on. maze_layout derives
+            # it from the wall positions in the world file, so it tracks
+            # the layout and not the file's formatting. run_policy
+            # reports it; a mismatch means retrain.
+            "layout_signature": self.layout_signature,
+
+            "layout_source": self.layout_source,
 
             "action_order": [
 
@@ -391,9 +410,21 @@ class QLearningAgent:
                 "state_format"
             )
 
+            self.layout_signature = data.get(
+                "layout_signature"
+            )
+
+            self.layout_source = data.get(
+                "layout_source"
+            )
+
         else:
 
             # Compatibility with old raw Q-table
             self.q_table = data
 
             self.state_format = None
+
+            self.layout_signature = None
+
+            self.layout_source = None

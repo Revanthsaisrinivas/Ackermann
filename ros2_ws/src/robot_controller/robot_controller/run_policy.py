@@ -2,17 +2,6 @@
 """
 Run the trained Q-Learning policy in Gazebo (or on the real robot).
 
-State format (7 values, maze-independent):
-
-(
-    dx,            # goal_x - robot_x
-    dy,            # goal_y - robot_y
-    heading,
-    east_wall,
-    north_wall,
-    west_wall,
-    south_wall
-)
 
 Action priority when Q-values are equal:
 
@@ -35,6 +24,7 @@ from .rl_environment import MazeEnvironment
 from .q_learning import QLearningAgent, STATE_FORMAT
 from .grid_rl_controller import GridRLController
 from .maze_memory import MazeMemory
+from . import maze_layout
 from .q_table_path import (
     ENV_VAR,
     describe_q_table_source,
@@ -55,17 +45,22 @@ Q_TABLE_FILE = q_table_path()
 
 MAX_STEPS = 100
 
-# Names of the 7 state elements, in order. Used only to check that a
+# Names of the 5 state elements, in order. Used only to check that a
 # loaded Q-table is keyed the same way the controller asks questions.
 EXPECTED_STATE_SHAPE = (
-    "dx",
-    "dy",
+    "robot_x",
+    "robot_y",
+    "goal_x",
+    "goal_y",
     "heading",
-    "east",
-    "north",
-    "west",
-    "south",
 )
+
+# A cell may be entered this many times before the run is called a loop.
+# The Q-table for a matching maze never revisits at all (every path it
+# drives is a shortest path), so anything above 1 already means the
+# table and the maze disagree. 3 leaves room for a legitimate detour
+# around a dynamic obstacle before the alarm goes off.
+REVISIT_LIMIT = 3
 
 
 # ============================================================
@@ -109,8 +104,8 @@ def action_name(action):
 # training. This must NOT use any knowledge of the true maze
 # layout (the real maze is unknown), so it works purely off:
 #
-#   - dx, dy   -> relative goal direction (already known: the
-#                 goal cell was given to the robot, and the
+#   - dx, dy   -> relative goal direction, derived from the state
+#                 (the goal cell was given to the robot, and the
 #                 robot's own cell comes from odometry)
 #   - valid_actions -> directions LIDAR currently reports open
 #
@@ -254,10 +249,54 @@ def load_agent():
         f"States: {len(agent.q_table)}"
     )
 
+    # ========================================================
+    # WHICH MAZE IS THIS TABLE FOR?
+    #
+    # The table is trained for one specific layout. The robot
+    # cannot check the layout from here - it does not know the
+    # maze, which is the whole point - so the signature is
+    # reported rather than verified, and the live cross-check in
+    # the step loop is what actually catches a mismatch.
+    # ========================================================
+
+    if agent.layout_signature:
+
+        print(
+            f"Trained on maze: {agent.layout_signature}"
+        )
+
+        try:
+            current = maze_layout.signature()
+
+            if current != agent.layout_signature:
+
+                print()
+                print("!" * 60)
+                print("WARNING: maze.world DOES NOT MATCH THIS Q-TABLE")
+                print("!" * 60)
+                print(f"  table trained on : {agent.layout_signature}")
+                print(f"  maze.world is now: {current}")
+                print()
+                print("  The walls moved since this table was trained, so")
+                print("  its route may not exist any more. Retrain:")
+                print("      python3 -m robot_controller.train")
+                print("!" * 60)
+
+        except Exception:
+            # No world file reachable from here. Not fatal: the robot
+            # is not entitled to it anyway.
+            pass
+
+    else:
+
+        print(
+            "Trained on maze: UNKNOWN (table predates layout stamping)"
+        )
+
     print()
 
     print(
-        "Mode: Q-TABLE + LIDAR-ONLY FALLBACK"
+        "Mode: Q-TABLE (primary) + DFS MEMORY (net)"
     )
 
     print(
@@ -281,6 +320,81 @@ def load_agent():
 #
 # EAST -> NORTH -> WEST -> SOUTH
 # ============================================================
+
+def print_drive_summary(steps, mismatch_reports):
+    """Say which decision-maker actually drove the run.
+
+    A run finished on the DFS fallback still prints "GOAL REACHED".
+    Without this, a table that no longer matches the maze looks exactly
+    like one that does - which is the failure this whole change is
+    about.
+    """
+
+    print()
+
+    if not mismatch_reports:
+
+        print(
+            f"Q-table drove all {steps} steps. No fallback was needed."
+        )
+
+        return
+
+    first_step = mismatch_reports[0][0]
+
+    print(
+        f"Q-table drove {first_step - 1}/{steps} steps, then DFS took "
+        f"over for the remaining {steps - first_step + 1}."
+    )
+
+    print()
+
+    print("First disagreement:")
+
+    print(f"  step {first_step}: {mismatch_reports[0][1]}")
+
+    if len(mismatch_reports) > 1:
+        print(
+            f"  ({len(mismatch_reports)} steps disagreed in total)"
+        )
+
+    print()
+
+    print("This maze does not match the trained table.")
+
+    print("    python3 -m robot_controller.train")
+
+
+def unrestricted_best_action(agent, state):
+    """The table's preferred action, ignoring what LIDAR reports.
+
+    `select_policy_action` only ever returns an action LIDAR says is
+    open, which means it can never reveal a table that disagrees with
+    the maze. This one does not filter, so comparing the two answers
+    the question "does this table still describe this maze?".
+
+    Returns None when the state is absent.
+    """
+
+    q_values = agent.q_table.get(state)
+
+    if q_values is None:
+        return None
+
+    best = ACTION_PRIORITY[0]
+
+    best_value = q_values[best]
+
+    for action in ACTION_PRIORITY[1:]:
+
+        if q_values[action] > best_value + 1e-9:
+
+            best_value = q_values[action]
+
+            best = action
+
+    return best
+
 
 def select_policy_action(
     agent,
@@ -377,7 +491,10 @@ def select_policy_action(
 
     print()
 
-    dx, dy = state[0], state[1]
+    # State is (robot_x, robot_y, goal_x, goal_y, heading), so the
+    # relative offset the fallback wants is derived, not stored.
+    dx = state[2] - state[0]
+    dy = state[3] - state[1]
 
     fallback_action = lidar_greedy_fallback(dx, dy, valid_actions)
 
@@ -561,6 +678,20 @@ def execute_policy(
 
         memory = MazeMemory(MazeEnvironment.GRID_SIZE)
 
+        # How many times each cell has been entered. A table that
+        # matches this maze drives shortest paths and never revisits,
+        # so a count above 1 is already evidence of a mismatch.
+        visit_counts = {}
+
+        # (step, description) for every step the Q-table could not
+        # take. Summarised at the end so a run that limped home on the
+        # fallback does not look like a clean one.
+        mismatch_reports = []
+
+        # Cleared for good the first time the table contradicts the
+        # maze. See the decision block for why this latches.
+        q_table_trusted = True
+
         for step_number in range(
 
             1,
@@ -601,6 +732,11 @@ def execute_policy(
 
                 print(
                     f"Total reward: {total_reward}"
+                )
+
+                print_drive_summary(
+                    step_number - 1,
+                    mismatch_reports,
                 )
 
                 robot.stop_robot()
@@ -659,7 +795,7 @@ def execute_policy(
             # =================================================
             # GET CURRENT STATE
             #
-            # (dx, dy, heading, east, north, west, south)
+            # (robot_x, robot_y, goal_x, goal_y, heading)
             #
             # Same `walls` reused again here, for the same reason
             # as above - one scan, one consistent picture of the
@@ -670,29 +806,132 @@ def execute_policy(
 
             memory.observe(current_cell, walls)
 
+            visit_counts[current_cell] = (
+                visit_counts.get(current_cell, 0) + 1
+            )
+
             # =================================================
             # SELECT ACTION FROM Q-TABLE
+            #
+            # THE Q-TABLE DRIVES. It was trained on this maze and
+            # verified to reach every goal by a shortest path, so
+            # there is nothing for a search to add - DFS is the net
+            # underneath, not a co-pilot.
+            #
+            # This used to be the other way round: memory.choose()
+            # took the wheel and accepted the Q-action only when it
+            # happened to point at an unvisited cell, so on a table
+            # that knew the answer the DFS rule still overrode it
+            # most of the time.
+            #
+            # Memory takes over only on a real disagreement, each of
+            # which is reported rather than silently absorbed:
+            #
+            #   1. the state is not in the table at all
+            #   2. the table's preferred move is into something LIDAR
+            #      says is a wall  -> the maze is not the maze this
+            #      table was trained on
+            #   3. the robot keeps re-entering a cell -> the table is
+            #      driving a loop, so it is stale for this maze
+            #
+            # All three mean "retrain for this maze". The run still
+            # finishes, because DFS needs no map.
             # =================================================
 
-            # Consult the Q-table only when it actually knows this
-            # state. When it doesn't, hand memory a None and let the
-            # frontier/backtrack rule decide, instead of the old
-            # memoryless greedy fallback that livelocked on dead ends.
+            q_action = None
+
+            disagreement = None
+
             if state in agent.q_table:
+
                 q_action = select_policy_action(
                     agent,
                     state,
                     valid_actions,
                 )
-            else:
-                q_action = None
 
-            action, reason = memory.choose(
-                current_cell,
-                goal,
-                valid_actions,
-                q_action,
-            )
+                # The table's own preference, ignoring what LIDAR
+                # says. If THAT is blocked, the table expects a door
+                # where this maze has a wall.
+                preferred = unrestricted_best_action(agent, state)
+
+                if preferred is not None and preferred not in valid_actions:
+
+                    disagreement = (
+                        f"Q-table wants {action_name(preferred)}, "
+                        f"but LIDAR reports it BLOCKED"
+                    )
+
+            else:
+
+                disagreement = f"state {state} is not in the Q-table"
+
+            if visit_counts[current_cell] > REVISIT_LIMIT:
+
+                disagreement = (
+                    f"cell {current_cell} entered "
+                    f"{visit_counts[current_cell]} times - the policy "
+                    f"is looping"
+                )
+
+            # A table caught out once is not to be trusted for the rest
+            # of the run. Training verified it drives every route in ITS
+            # maze without a single revisit, so one real disagreement
+            # means this is not that maze - and the Q-values still to
+            # come are describing walls that are not there.
+            #
+            # Latching matters. Measured against a maze with one wall
+            # moved: handing back to the table after each disagreement
+            # reaches 586/600 start/goal pairs, because the table keeps
+            # steering into the same changed corridor. Latching to DFS
+            # reaches 600/600. On the correct maze the latch never
+            # fires, so it costs nothing.
+
+            if disagreement is not None and q_table_trusted:
+
+                q_table_trusted = False
+
+                print()
+                print("!" * 60)
+                print("Q-TABLE / MAZE DISAGREEMENT")
+                print("!" * 60)
+                print(f"  step {step_number}: {disagreement}")
+                print()
+                print("  The Q-table was verified against the maze it was")
+                print("  trained on, so this means the robot is not in")
+                print("  that maze. Handing the rest of this run to DFS")
+                print("  memory, which needs no map.")
+                print()
+                print("  Retrain for this maze:")
+                print("      python3 -m robot_controller.train")
+                print("!" * 60)
+
+            if (
+                q_action is not None
+                and
+                disagreement is None
+                and
+                q_table_trusted
+            ):
+
+                action = q_action
+
+                reason = "q-table"
+
+            else:
+
+                if disagreement is not None:
+
+                    mismatch_reports.append(
+                        (step_number, disagreement)
+                    )
+
+                action, reason = memory.choose(
+                    current_cell,
+                    goal,
+                    valid_actions,
+                    q_action,
+                )
 
             if action is None:
 
@@ -921,6 +1160,11 @@ def execute_policy(
 
                 print(
                     f"Total reward: {total_reward}"
+                )
+
+                print_drive_summary(
+                    step_number,
+                    mismatch_reports,
                 )
 
                 robot.stop_robot()
