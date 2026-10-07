@@ -379,48 +379,6 @@ class MazeEnvironment:
 
         return valid_actions
 
-    # ============================================================
-    # ABSOLUTE 5-VALUE STATE
-    #
-    # (
-    #     robot_x,
-    #     robot_y,
-    #     goal_x,
-    #     goal_y,
-    #     heading
-    # )
-    #
-    # WHY ABSOLUTE, AND WHY THE WALL BITS ARE GONE
-    # --------------------------------------------
-    # The state used to be the relative 7-tuple
-    # (dx, dy, heading, east, north, west, south), chosen so one table
-    # would transfer to a maze the robot had never seen.
-    #
-    # It does not survive contact with a single fixed maze. Relative
-    # offsets do not pin down which cell the robot is in: 2400
-    # (start, goal, heading) triples in maze.world collapse onto 1656
-    # distinct states, 608 of them shared by more than one cell. In 80
-    # of those, no single action is on a shortest path for every cell
-    # that maps there - so the encoding cannot represent an optimal
-    # policy, however long it trains. Measured ceiling for ANY policy
-    # on the 7-tuple, in this maze: 90.8% of pairs reach the goal. The
-    # other 9% loop forever, which is what the DFS fallback was
-    # quietly covering up.
-    #
-    # The absolute state has no aliasing. 25 cells x 25 goals x 4
-    # headings = 2500 states, every one enumerable, and the greedy
-    # table alone solves every solvable pair by a shortest path.
-    #
-    # The wall bits are dropped because they are now redundant: in a
-    # FIXED maze the cell determines its own walls, so carrying them
-    # added nothing the cell did not already say.
-    #
-    # THIS IS NOT THE ROBOT READING THE MAZE. The executor knows where
-    # it is (odometry) and where it was told to go. It still never
-    # reads blocked_edges, and the layout reaches it only through what
-    # training baked into the Q-values. A table is therefore valid for
-    # the maze it was trained on: change maze.world, retrain.
-    # ============================================================
 
     def get_state(self):
 

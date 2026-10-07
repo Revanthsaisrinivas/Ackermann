@@ -253,6 +253,7 @@ class GridRLController(Node):
                 self.scan_ready
                 and
                 self.odom_ready
+                
             ):
 
                 break
